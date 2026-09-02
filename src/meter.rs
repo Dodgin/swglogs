@@ -40,6 +40,14 @@ impl Encounter {
     }
 }
 
+/// A one-line message shown at the top of the meter page (and on /debug).
+/// While `client_pid` is set, the notice is dropped automatically once that
+/// game client process is gone — i.e. the player has restarted the client.
+pub struct Notice {
+    pub text: String,
+    pub client_pid: Option<u32>,
+}
+
 pub struct Meter {
     gap: f64,
     pub player: Option<String>,
@@ -59,6 +67,8 @@ pub struct Meter {
     pub log_path: String,
     pub last_write: Option<f64>,
     unparsed: VecDeque<String>,
+    pub notice: Option<Notice>,
+    notice_checked: f64,
 }
 
 impl Meter {
@@ -78,6 +88,8 @@ impl Meter {
             log_path: String::new(),
             last_write: None,
             unparsed: VecDeque::new(),
+            notice: None,
+            notice_checked: 0.0,
         }
     }
 
@@ -196,7 +208,7 @@ impl Meter {
         format!(
             "{{\"current\":{},\"last\":{},\"overall\":{},\"meta\":{{\
              \"player\":{},\"stale\":{},\"encounters\":{},\"events\":{},\
-             \"lines\":{},\"unparsed\":{},\"log\":{},\"now\":{:.3}}}}}",
+             \"lines\":{},\"unparsed\":{},\"log\":{},\"notice\":{},\"now\":{:.3}}}}}",
             cur.unwrap_or_else(|| "null".to_string()),
             last.unwrap_or_else(|| "null".to_string()),
             overall,
@@ -207,8 +219,25 @@ impl Meter {
             self.lines,
             self.unparsed.len(),
             json_str(&self.log_path),
+            self.notice.as_ref().map(|n| json_str(&n.text)).unwrap_or_else(|| "null".to_string()),
             now_secs(),
         )
+    }
+
+    /// Drop a client-restart notice once the client process it was raised
+    /// for no longer exists. `client_pid` is polled at most every 5 s.
+    pub fn expire_notice(&mut self, now: f64, client_pid: impl Fn() -> Option<u32>) {
+        let pid = match &self.notice {
+            Some(Notice { client_pid: Some(p), .. }) => *p,
+            _ => return,
+        };
+        if now - self.notice_checked < 5.0 {
+            return;
+        }
+        self.notice_checked = now;
+        if client_pid() != Some(pid) {
+            self.notice = None;
+        }
     }
 
     pub fn debug_text(&self) -> String {
@@ -218,6 +247,11 @@ impl Meter {
             self.log_path, self.lines, self.events, self.encounter_count,
             self.unparsed.len()
         );
+        if let Some(n) = &self.notice {
+            s.push_str("notice: ");
+            s.push_str(&n.text);
+            s.push('\n');
+        }
         if self.unparsed.is_empty() {
             s.push_str("\nNo unparsed combat lines yet.\n");
         } else {

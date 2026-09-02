@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Deep space background -->
+    <radialGradient id="space" cx="38%" cy="30%" r="95%">
+      <stop offset="0%" stop-color="#1B3A5C"/>
+      <stop offset="55%" stop-color="#0F2440"/>
+      <stop offset="100%" stop-color="#081527"/>
+    </radialGradient>
+
+    <!-- Energy beam stroke -->
+    <linearGradient id="beam" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"  stop-color="#2FB8D9"/>
+      <stop offset="55%" stop-color="#4FE3F2"/>
+      <stop offset="78%" stop-color="#FFC864"/>
+      <stop offset="100%" stop-color="#FF9E3D"/>
+    </linearGradient>
+
+    <!-- Area fill under the graph -->
+    <linearGradient id="area" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#3ED4EC" stop-opacity="0.34"/>
+      <stop offset="100%" stop-color="#3ED4EC" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Peak burst -->
+    <radialGradient id="burst" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#FFF3D6" stop-opacity="0.95"/>
+      <stop offset="35%"  stop-color="#FFC864" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FFC864" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="16" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="squircle">
+      <path d="M512 28c336 0 484 148 484 484s-148 484-484 484S28 848 28 512 176 28 512 28Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Icon body -->
+  <g clip-path="url(#squircle)">
+    <rect width="1024" height="1024" fill="url(#space)"/>
+
+    <!-- Star field (sparse, hand-placed) -->
+    <g fill="#BFE9F5">
+      <circle cx="168" cy="182" r="5.5" opacity="0.85"/>
+      <circle cx="330" cy="120" r="3"   opacity="0.55"/>
+      <circle cx="864" cy="150" r="4.5" opacity="0.7"/>
+      <circle cx="722" cy="236" r="2.6" opacity="0.5"/>
+      <circle cx="120" cy="560" r="3.2" opacity="0.45"/>
+      <circle cx="906" cy="560" r="3"   opacity="0.5"/>
+      <circle cx="248" cy="884" r="4"   opacity="0.6"/>
+      <circle cx="808" cy="856" r="5"   opacity="0.7"/>
+      <circle cx="560" cy="112" r="2.4" opacity="0.4"/>
+    </g>
+
+    <!-- Targeting reticle, faint, behind the graph -->
+    <g stroke="#3E6E96" fill="none" opacity="0.55">
+      <circle cx="512" cy="512" r="316" stroke-width="10"/>
+      <circle cx="512" cy="512" r="222" stroke-width="6" opacity="0.6"/>
+      <line x1="512" y1="130" x2="512" y2="252" stroke-width="12" stroke-linecap="round"/>
+      <line x1="512" y1="772" x2="512" y2="894" stroke-width="12" stroke-linecap="round"/>
+      <line x1="130" y1="512" x2="252" y2="512" stroke-width="12" stroke-linecap="round"/>
+      <line x1="772" y1="512" x2="894" y2="512" stroke-width="12" stroke-linecap="round"/>
+    </g>
+
+    <!-- Area under the damage curve -->
+    <path fill="url(#area)"
+      d="M0 758 L96 700 L268 596 L356 668 L452 452 L540 588 L668 300 L742 476 L852 388 L928 452 L1024 512 L1024 1024 L0 1024 Z"/>
+
+    <!-- Damage-over-time beam -->
+    <path fill="none" stroke="url(#beam)" stroke-width="46"
+      stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"
+      d="M96 700 L268 596 L356 668 L452 452 L540 588 L668 300 L742 476 L852 388 L928 452"/>
+
+    <!-- Peak hit burst -->
+    <circle cx="668" cy="300" r="150" fill="url(#burst)"/>
+    <circle cx="668" cy="300" r="34" fill="#FFF6E3"/>
+    <circle cx="668" cy="300" r="52" fill="none" stroke="#FFD98A" stroke-width="10" opacity="0.8"/>
+  </g>
+
+  <!-- Rim light on the squircle edge -->
+  <path d="M512 28c336 0 484 148 484 484s-148 484-484 484S28 848 28 512 176 28 512 28Z"
+        fill="none" stroke="#4A7EA8" stroke-width="10" opacity="0.6"/>
+</svg>

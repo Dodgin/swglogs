@@ -1,169 +1,57 @@
-//! swglogs — SWG Legends combat logs + Details-style meter.
+//! swglogs — the one executable. Double-click: opens the status window
+//! (feature `gui`, on by default). `--headless`: console only. The meter
+//! itself lives in the library (`src/lib.rs`).
 //!
-//! One normalized combat-event stream, two sinks: a live web meter and a
-//! real-time structured log (JSONL). Sources are pluggable:
-//!   --source chatlog  (default) tail the player's own chatlog
-//!   --source ipc      drain the shared-memory IPC ring (external producer)
-//!   --source demo     synthetic combat, no game needed
-//!
-//!   swglogs [--source chatlog|ipc|demo] [--port N] [--host H] [--gap S]
-//!           [--player NAME] [--profiles DIR] [--log FILE] [--replay]
-//!           [--out combat.jsonl | --no-log] [--selftest]
+//!   swglogs [--headless] [--source memory|chatlog|ipc|demo] [--port N] [--host H]
+//!           [--gap S] [--player NAME] [--profiles DIR] [--log FILE] [--replay]
+//!           [--out combat.jsonl | --no-log] [--game-dir DIR] [--no-ui-patch]
+//!           [--selftest]
 
-mod event;
-mod logwriter;
-mod meter;
-mod parse;
-mod server;
-mod sources;
+// No console window of our own; see app::attach_parent_console for terminals.
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use logwriter::LogWriter;
-use meter::Meter;
-use sources::Sink;
-
-struct Args {
-    source: String,
-    host: String,
-    port: u16,
-    gap: f64,
-    player: Option<String>,
-    profiles: PathBuf,
-    log: Option<PathBuf>,
-    out: Option<String>,
-    replay: bool,
-    selftest: bool,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            source: "chatlog".into(),
-            host: "127.0.0.1".into(),
-            port: 8666,
-            gap: 8.0,
-            player: None,
-            profiles: PathBuf::from(r"C:\SWG Legends\profiles"),
-            log: None,
-            out: Some("combat-log.jsonl".into()),
-            replay: false,
-            selftest: false,
-        }
-    }
-}
-
-fn parse_args() -> Args {
-    let mut a = Args::default();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    let next = |i: &mut usize| -> String {
-        *i += 1;
-        argv.get(*i).cloned().unwrap_or_default()
-    };
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--source" => a.source = next(&mut i),
-            "--host" => a.host = next(&mut i),
-            "--port" => a.port = next(&mut i).parse().unwrap_or(8666),
-            "--gap" => a.gap = next(&mut i).parse().unwrap_or(8.0),
-            "--player" => a.player = Some(next(&mut i)),
-            "--profiles" => a.profiles = PathBuf::from(next(&mut i)),
-            "--log" => a.log = Some(PathBuf::from(next(&mut i))),
-            "--out" => a.out = Some(next(&mut i)),
-            "--no-log" => a.out = None,
-            "--replay" => a.replay = true,
-            "--selftest" => a.selftest = true,
-            "-h" | "--help" => {
-                print_help();
-                std::process::exit(0);
-            }
-            other => eprintln!("[swglogs] ignoring unknown arg: {}", other),
-        }
-        i += 1;
-    }
-    a
-}
-
-fn print_help() {
-    println!(
-        "swglogs — SWG Legends combat logs + meter\n\n\
-         --source chatlog|ipc|demo   event source (default chatlog)\n\
-         --port N       HTTP port (default 8666)\n\
-         --host H       bind host (default 127.0.0.1)\n\
-         --gap S        seconds of silence that ends an encounter (default 8)\n\
-         --player NAME  your character, highlighted (default: none)\n\
-         --profiles DIR chatlog search root (default C:\\SWG Legends\\profiles)\n\
-         --log FILE     tail this exact chatlog instead of auto-detecting\n\
-         --replay       parse the whole existing chatlog first, then tail\n\
-         --out FILE     real-time JSONL log (default combat-log.jsonl)\n\
-         --no-log       disable the real-time log\n\
-         --selftest     run parser/aggregator checks and exit\n\n\
-         In game:  /browser http://127.0.0.1:8666/   (also /healing, /taken)"
-    );
-}
+use swglogs::app;
 
 fn main() {
-    let args = parse_args();
-    // Diagnostic: SWGLOGS_EXIT_AFTER=<secs> ends the process after that long
-    // (lets a timed, elevated test run stop on its own).
-    if let Some(secs) = std::env::var("SWGLOGS_EXIT_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) {
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            std::process::exit(0);
-        });
-    }
-    if args.selftest {
+    app::attach_parent_console();
+    let cfg = app::parse_args();
+    app::install_exit_after();
+    if cfg.selftest {
         std::process::exit(selftest::run());
     }
 
-    let meter = Arc::new(Mutex::new(Meter::new(args.gap, args.player.clone())));
-    let log = match &args.out {
-        Some(path) => match LogWriter::open(path) {
-            Ok(w) => {
-                println!("[swglogs] real-time log: {}", w.path);
-                Some(Arc::new(Mutex::new(w)))
-            }
-            Err(e) => {
-                eprintln!("[swglogs] could not open log {}: {}", path, e);
-                None
-            }
-        },
-        None => None,
-    };
+    let running = app::start(&cfg);
 
-    let sink = Sink { meter: Arc::clone(&meter), log };
-
-    // spawn the chosen source
-    {
-        let sink = sink.clone();
-        let source = args.source.clone();
-        let profiles = args.profiles.clone();
-        let fixed = args.log.clone();
-        let replay = args.replay;
-        std::thread::spawn(move || match source.as_str() {
-            "demo" => sources::demo(sink),
-            "ipc" => sources::ipc::ipc_ring(sink),
-            "memory" => sources::memory::run(sink),
-            _ => sources::chatlog_tail(sink, profiles, fixed, replay),
-        });
+    #[cfg(feature = "gui")]
+    if !cfg.headless {
+        // Blocks until the window is closed; closing it stops the meter.
+        if let Err(e) = swglogs::gui::run(running) {
+            eprintln!("[swglogs] window error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(not(feature = "gui"))]
+    if !cfg.headless {
+        eprintln!("[swglogs] built without the gui feature; running headless");
     }
 
-    let addr = format!("{}:{}", args.host, args.port);
-    println!("[swglogs] serving http://{}/   (debug: /debug)", addr);
-    println!("[swglogs] in game:  /browser http://{}/", addr);
-    if let Err(e) = server::serve(&addr, meter) {
-        eprintln!("[swglogs] server error: {}", e);
-        std::process::exit(1);
+    // Headless: everything runs on background threads; stay alive until the
+    // server dies (e.g. the port was in use), then exit non-zero.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Some(e) = running.server_error.lock().unwrap().as_ref() {
+            eprintln!("[swglogs] exiting: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
 // --------------------------------------------------------------------------
 mod selftest {
-    use crate::event::fmt_ts;
-    use crate::meter::Meter;
-    use crate::parse::{parse_line, Parsed};
+    use swglogs::event::fmt_ts;
+    use swglogs::meter::Meter;
+    use swglogs::parse::{parse_line, Parsed};
 
     // Verbatim real chatlog lines + a couple not-yet-seen guesses.
     const LINES: &[&str] = &[
@@ -229,7 +117,17 @@ mod selftest {
         check(has_ability(&snap, "Yourname", "Killing Spree"), "hit labeled 'Killing Spree'");
         check(has_ability(&snap, "Yourname", "fire damage"), "DoT labeled 'fire damage'");
         check(fmt_ts(1_756_744_800.0).starts_with("2025-"), "fmt_ts civil date sane");
-        crate::sources::memory::selfcheck(&mut check);
+        swglogs::sources::memory::selfcheck(&mut check);
+        swglogs::uipatch::selfcheck(&mut check);
+        {
+            let mut m2 = Meter::new(8.0, None);
+            m2.notice = Some(swglogs::meter::Notice { text: "x".into(), client_pid: Some(1) });
+            m2.expire_notice(1000.0, || Some(1));
+            check(m2.notice.is_some(), "notice kept while the client pid is unchanged");
+            m2.expire_notice(1010.0, || None);
+            check(m2.notice.is_none(), "notice cleared once the client is gone/restarted");
+            check(m2.snapshot_json().contains("\"notice\":null"), "snapshot carries notice field");
+        }
 
         println!("\nself-test {}", if ok { "PASSED" } else { "FAILED" });
         if ok { 0 } else { 1 }

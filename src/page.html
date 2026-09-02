@@ -11,6 +11,8 @@ html,body{margin:0;padding:0;background:#0d0f12;color:#cfd6dd;
 button{background:#1d222a;color:#aeb6bf;border:1px solid #2b323c;border-radius:3px;
   font:11px "Segoe UI",Arial;padding:2px 7px;margin-left:3px;cursor:pointer}
 #meta{color:#5f6873;font-size:10px;margin-left:auto;padding-left:6px;white-space:nowrap}
+#notice{display:none;background:#5a3b00;color:#ffd76e;border-bottom:1px solid #8a5a00;
+  padding:4px 6px;font-weight:bold;white-space:normal}
 #rows{padding:2px 4px}
 .row{position:relative;height:17px;margin:2px 0;background:#14171c;
   border-radius:2px;overflow:hidden;cursor:pointer}
@@ -25,6 +27,7 @@ button{background:#1d222a;color:#aeb6bf;border:1px solid #2b323c;border-radius:3
 <div id="hdr"><span class="t">SWG Logs</span>
 <button id="bView">Now</button><button id="bMode">Damage</button><button id="bClear">Clear</button>
 <span id="meta"></span></div>
+<div id="notice"></div>
 <div id="rows"><div id="empty">waiting for data&hellip;</div></div>
 <script>
 var view='current', mode='dmg', open={}, data=null;
@@ -64,6 +67,8 @@ function render(){
   $('bMode').textContent=MODE_LBL[mode];
   var rowsEl=$('rows');
   if(!data){return;}
+  var nt=$('notice'),msg=data.meta&&data.meta.notice;
+  nt.style.display=msg?'block':'none';if(msg)nt.textContent=msg;
   var enc=data[view], idle='';
   if(!enc&&view==='current'&&data.last){enc=data.last;idle=' idle';}
   if(!enc){rowsEl.innerHTML='<div id="empty">no data yet</div>';

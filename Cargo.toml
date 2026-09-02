@@ -2,14 +2,26 @@
 name = "swglogs"
 version = "0.1.0"
 edition = "2021"
-description = "SWG Legends combat logs + Details-style meter: one normalized combat-event stream fanned out to a live web meter and a real-time structured log (JSONL). Sources: chatlog tail, or a shared-memory IPC ring fed by an external producer."
+rust-version = "1.86"
+resolver = "3"
+description = "SWG Legends combat logs + Details-style meter: one normalized combat-event stream fanned out to a live web meter and a real-time structured log (JSONL). Sources: the client's combat scrollback (memory), chatlog tail, or a shared-memory IPC ring fed by an external producer."
 
+[lib]
+path = "src/lib.rs"
+
+# One executable: double-click opens the status window; `--headless` runs
+# console-only. Build with `--no-default-features` for a std-only, windowless
+# console build that needs no registry access.
 [[bin]]
 name = "swglogs"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe"]
+
 [profile.release]
 opt-level = 2
 
-# Intentionally dependency-free (std only) so it builds with no registry access.
 [dependencies]
+eframe = { version = "0.32", optional = true, default-features = false, features = ["glow", "default_fonts"] }

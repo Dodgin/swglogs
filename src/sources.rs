@@ -414,6 +414,11 @@ pub mod memory {
         fn CloseHandle(h: Handle) -> i32;
     }
 
+    /// PID of the running game client, if any (used to notice a restart).
+    pub fn client_pid() -> Option<u32> {
+        find_pid()
+    }
+
     fn find_pid() -> Option<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -905,4 +910,7 @@ pub mod memory {
         eprintln!("[swglogs] memory source is Windows-only");
     }
     pub fn selfcheck(_check: &mut dyn FnMut(bool, &str)) {}
+    pub fn client_pid() -> Option<u32> {
+        None
+    }
 }
