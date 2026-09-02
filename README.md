@@ -47,8 +47,9 @@ can run several).
 gap, default 8) · `--player NAME` (highlighted; unset by default) · `--profiles
 DIR` · `--log FILE` (pin an exact chatlog) · `--replay` (parse the whole log
 first, then tail) · `--out FILE` (JSONL log, default `combat-log.jsonl`) ·
-`--no-log` · `--selftest` · `--game-dir DIR` (game install, default: parent of
-`--profiles`) · `--no-ui-patch`.
+`--no-log` · `--selftest` · `--game-dir DIR` (game install; by default the
+folder of the running `SwgClient_r.exe`, else the parent of `--profiles`) ·
+`--no-ui-patch`.
 
 On startup swglogs patches the game's loose `ui\ui_pda.inc` (if present) so the
 `/browser` window carries `StickyVisible='true'` and stays open when you leave

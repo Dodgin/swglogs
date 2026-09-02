@@ -11,6 +11,7 @@ use crate::server;
 use crate::sources::{self, Sink};
 use crate::uipatch;
 
+#[derive(Clone)]
 pub struct Config {
     pub source: String,
     pub host: String,
@@ -18,6 +19,8 @@ pub struct Config {
     pub gap: f64,
     pub player: Option<String>,
     pub profiles: PathBuf,
+    /// `--profiles` was given (otherwise it follows the detected game dir).
+    pub profiles_explicit: bool,
     pub log: Option<PathBuf>,
     pub out: Option<String>,
     pub replay: bool,
@@ -37,6 +40,7 @@ impl Default for Config {
             gap: 8.0,
             player: None,
             profiles: PathBuf::from(r"C:\SWG Legends\profiles"),
+            profiles_explicit: false,
             log: None,
             out: Some("combat-log.jsonl".into()),
             replay: false,
@@ -64,7 +68,10 @@ pub fn parse_args() -> Config {
             "--port" => a.port = next(&mut i).parse().unwrap_or(8666),
             "--gap" => a.gap = next(&mut i).parse().unwrap_or(8.0),
             "--player" => a.player = Some(next(&mut i)),
-            "--profiles" => a.profiles = PathBuf::from(next(&mut i)),
+            "--profiles" => {
+                a.profiles = PathBuf::from(next(&mut i));
+                a.profiles_explicit = true;
+            }
             "--log" => a.log = Some(PathBuf::from(next(&mut i))),
             "--out" => a.out = Some(next(&mut i)),
             "--no-log" => a.out = None,
@@ -99,9 +106,10 @@ pub fn print_help() {
          --out FILE     real-time JSONL log (default combat-log.jsonl)\n\
          --no-log       disable the real-time log\n\
          --selftest     run parser/aggregator checks and exit\n\
-         --game-dir DIR game install (default: parent of --profiles); its\n\
-                        ui\\ui_pda.inc is patched so the /browser window stays\n\
-                        open in shoot mode (StickyVisible)\n\
+         --game-dir DIR game install (default: the running client's folder,\n\
+                        else the parent of --profiles); its ui\\ui_pda.inc is\n\
+                        patched so the /browser window stays open in shoot mode\n\
+                        and ignores Escape\n\
          --no-ui-patch  skip that patch\n\
          --headless     console only, don't open the window\n\n\
          In game:  /browser http://127.0.0.1:8666/   (also /healing, /taken)"
@@ -151,14 +159,54 @@ pub struct Running {
     pub server_error: Arc<Mutex<Option<String>>>,
 }
 
+/// Where the game is installed, and how we know: `--game-dir`, else the
+/// folder of the running `SwgClient_r.exe`, else the parent of `--profiles`
+/// (whose default is the stock `C:\SWG Legends\profiles`).
+pub fn game_dir(cfg: &Config) -> (PathBuf, &'static str) {
+    if let Some(d) = &cfg.game_dir {
+        return (d.clone(), "--game-dir");
+    }
+    if let Some(d) = sources::memory::client_exe_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        return (d, "folder of the running game client");
+    }
+    (
+        cfg.profiles.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")),
+        "default; start the game first (or pass --game-dir) if this is wrong",
+    )
+}
+
 /// Apply the UI patch, open the real-time log, spawn the event source and the
 /// HTTP server. Returns immediately; everything runs on background threads.
 pub fn start(cfg: &Config) -> Running {
-    let notice = apply_ui_patch(cfg);
+    let (gdir, how) = game_dir(cfg);
+    println!("[swglogs] game directory: {} ({})", gdir.display(), how);
+    let from_client = how.starts_with("folder of");
+    // profiles live under the game dir unless the user said otherwise
+    let profiles = if from_client && !cfg.profiles_explicit { gdir.join("profiles") } else { cfg.profiles.clone() };
+    let notice = apply_ui_patch(cfg, &gdir);
 
     let meter = Arc::new(Mutex::new(Meter::new(cfg.gap, cfg.player.clone())));
     if let Some(n) = notice {
         meter.lock().unwrap().notice = Some(n);
+    }
+
+    // Started before the game? Once the client appears, patch ITS folder if
+    // that turns out to be somewhere else than we guessed.
+    if cfg.ui_patch && cfg.game_dir.is_none() && !from_client {
+        let cfg2 = cfg.clone();
+        let meter2 = Arc::clone(&meter);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if let Some(dir) = sources::memory::client_exe_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                if dir != gdir {
+                    println!("[swglogs] game client found in {} — checking its ui\\ui_pda.inc", dir.display());
+                    if let Some(n) = apply_ui_patch(&cfg2, &dir) {
+                        meter2.lock().unwrap().notice = Some(n);
+                    }
+                }
+                return;
+            }
+        });
     }
     let log = match &cfg.out {
         Some(path) => match LogWriter::open(path) {
@@ -180,7 +228,7 @@ pub fn start(cfg: &Config) -> Running {
     {
         let sink = sink.clone();
         let source = cfg.source.clone();
-        let profiles = cfg.profiles.clone();
+        let profiles = profiles.clone();
         let fixed = cfg.log.clone();
         let replay = cfg.replay;
         std::thread::spawn(move || match source.as_str() {
@@ -213,16 +261,11 @@ pub fn start(cfg: &Config) -> Running {
 /// Make sure the game's `/browser` window survives action mode (see
 /// `uipatch`). Returns a notice for the meter page when an already-running
 /// client still has the old file loaded and must be restarted.
-fn apply_ui_patch(cfg: &Config) -> Option<Notice> {
+fn apply_ui_patch(cfg: &Config, game_dir: &std::path::Path) -> Option<Notice> {
     if !cfg.ui_patch {
         return None;
     }
-    let game_dir = cfg
-        .game_dir
-        .clone()
-        .or_else(|| cfg.profiles.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    match uipatch::ensure_sticky_browser(&game_dir) {
+    match uipatch::ensure_sticky_browser(game_dir) {
         Ok(uipatch::Outcome::AlreadySet) => None,
         Ok(uipatch::Outcome::Patched(backup)) => {
             println!(

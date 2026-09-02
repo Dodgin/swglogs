@@ -434,6 +434,32 @@ pub mod memory {
         find_pid()
     }
 
+    /// Full path of the running game client's executable, e.g.
+    /// `C:\SWG Legends\SwgClient_r.exe` — the one reliable way to find the
+    /// install. Needs only limited query rights, which Windows grants even
+    /// across elevation levels.
+    pub fn client_exe_path() -> Option<std::path::PathBuf> {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        extern "system" {
+            fn QueryFullProcessImageNameW(h: Handle, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+        }
+        let pid = find_pid()?;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            if ok == 0 {
+                return None;
+            }
+            Some(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+        }
+    }
+
     fn find_pid() -> Option<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -470,6 +496,17 @@ pub mod memory {
         }
     }
     impl Proc {
+        /// Still running? (A handle keeps working after the process exits —
+        /// every read just fails — so this is checked explicitly.)
+        fn alive(&self) -> bool {
+            extern "system" {
+                fn GetExitCodeProcess(h: Handle, code: *mut u32) -> i32;
+            }
+            const STILL_ACTIVE: u32 = 259;
+            let mut code = 0u32;
+            unsafe { GetExitCodeProcess(self.0, &mut code) != 0 && code == STILL_ACTIVE }
+        }
+
         fn read(&self, addr: usize, buf: &mut [u8]) -> usize {
             let mut got = 0usize;
             let ok = unsafe {
@@ -787,23 +824,40 @@ pub mod memory {
         }
     }
 
+    /// Follow the game client for as long as swglogs runs: wait for it to
+    /// start, track its combat text until it exits, then wait for the next
+    /// one. The meter keeps its numbers across client restarts.
     pub fn run(sink: Sink) {
-        let pid = match find_pid() {
-            Some(p) => p,
-            None => {
-                sink.set_log_label("(memory: SwgClient_r.exe not running)");
-                std::thread::sleep(Duration::from_secs(2));
-                return run(sink);
+        let mut announced = false;
+        loop {
+            let pid = match find_pid() {
+                Some(p) => p,
+                None => {
+                    if !announced {
+                        sink.set_log_label("(memory: SwgClient_r.exe not running — waiting for the game to start)");
+                        announced = true;
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            announced = false;
+            let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+            if h.is_null() {
+                sink.set_log_label("(memory: OpenProcess failed — run swglogs as Administrator)");
+                eprintln!("[swglogs] OpenProcess failed; run as Administrator");
+                return;
             }
-        };
-        let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
-        if h.is_null() {
-            sink.set_log_label("(memory: OpenProcess failed — run swglogs as Administrator)");
-            eprintln!("[swglogs] OpenProcess failed; run as Administrator");
-            return;
+            let proc = Proc(h);
+            sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} — scanning for combat text)", pid));
+            follow(&sink, &proc, pid);
+            sink.set_log_label(&format!("(memory: game client pid {} exited — waiting for it to start again)", pid));
+            std::thread::sleep(Duration::from_secs(2));
         }
-        let proc = Proc(h);
-        sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} — scanning for combat text)", pid));
+    }
+
+    /// Track one client process's combat text until that process exits.
+    fn follow(sink: &Sink, proc: &Proc, pid: u32) {
 
         const SLACK: usize = 0x8000; // read this much before/after a region
         let mut cands: Vec<Cand> = Vec::new();
@@ -823,6 +877,9 @@ pub mod memory {
                 m.tick(now_secs());
             }
             let now = now_secs();
+            if !proc.alive() {
+                return;
+            }
 
             // (Re)scan the client for combat text: at start, whenever nothing
             // is being followed, every 10 s while the followed region has been
@@ -834,7 +891,7 @@ pub mod memory {
                 last_scan = now;
                 let regions = match pinned {
                     Some(r) => vec![(r, r + 0x10000)],
-                    None => candidates(&scan_bins(&proc)),
+                    None => candidates(&scan_bins(proc)),
                 };
                 let prim_region = primary.map(|p| (cands[p].start, cands[p].end));
                 let mut next: Vec<Cand> = Vec::with_capacity(regions.len());
@@ -1073,6 +1130,9 @@ pub mod memory {
     }
     pub fn selfcheck(_check: &mut dyn FnMut(bool, &str)) {}
     pub fn client_pid() -> Option<u32> {
+        None
+    }
+    pub fn client_exe_path() -> Option<std::path::PathBuf> {
         None
     }
 }
