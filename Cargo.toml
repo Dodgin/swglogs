@@ -1,0 +1,15 @@
+[package]
+name = "swglogs"
+version = "0.1.0"
+edition = "2021"
+description = "SWG Legends combat logs + Details-style meter: one normalized combat-event stream fanned out to a live web meter and a real-time structured log (JSONL). Sources: chatlog tail, or a shared-memory IPC ring fed by an external producer."
+
+[[bin]]
+name = "swglogs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+
+# Intentionally dependency-free (std only) so it builds with no registry access.
+[dependencies]

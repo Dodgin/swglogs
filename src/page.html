@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SWG Logs</title>
+<style>
+html,body{margin:0;padding:0;background:#0d0f12;color:#cfd6dd;
+  font:12px/1.35 "Segoe UI",Arial,sans-serif;-webkit-user-select:none}
+#hdr{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;
+  background:#15181d;border-bottom:1px solid #262b33;padding:3px 6px}
+#hdr .t{font-weight:bold;color:#e8b64c;margin-right:4px}
+button{background:#1d222a;color:#aeb6bf;border:1px solid #2b323c;border-radius:3px;
+  font:11px "Segoe UI",Arial;padding:2px 7px;margin-left:3px;cursor:pointer}
+#meta{color:#5f6873;font-size:10px;margin-left:auto;padding-left:6px;white-space:nowrap}
+#rows{padding:2px 4px}
+.row{position:relative;height:17px;margin:2px 0;background:#14171c;
+  border-radius:2px;overflow:hidden;cursor:pointer}
+.bar{position:absolute;left:0;top:0;bottom:0;opacity:.85;border-radius:2px}
+.lbl{position:relative;display:-webkit-flex;display:flex;
+  -webkit-justify-content:space-between;justify-content:space-between;
+  padding:1px 5px;text-shadow:0 1px 2px rgba(0,0,0,.8);white-space:nowrap}
+.me .lbl .n{color:#ffd76e;font-weight:bold}
+.abil{font-size:10px;color:#8b95a1;padding:1px 10px 3px}
+#empty{color:#4c545e;text-align:center;padding:18px 6px}
+</style></head><body>
+<div id="hdr"><span class="t">SWG Logs</span>
+<button id="bView">Now</button><button id="bMode">Damage</button><button id="bClear">Clear</button>
+<span id="meta"></span></div>
+<div id="rows"><div id="empty">waiting for data&hellip;</div></div>
+<script>
+var view='current', mode='dmg', open={}, data=null;
+if(location.pathname.indexOf('healing')>=0)mode='heal';
+else if(location.pathname.indexOf('taken')>=0)mode='taken';
+var VIEWS=['current','last','overall'];
+var MODES=['dmg','heal','taken'];
+var MODE_LBL={dmg:'Damage',heal:'Healing',taken:'Taken'};
+var VIEW_LBL={current:'Now',last:'Last',overall:'All'};
+function $(id){return document.getElementById(id);}
+$('bView').onclick=function(){view=VIEWS[(indexOf(VIEWS,view)+1)%3];render();};
+$('bMode').onclick=function(){mode=MODES[(indexOf(MODES,mode)+1)%3];render();};
+$('bClear').onclick=function(){var x=new XMLHttpRequest();
+  x.open('GET','/clear',true);
+  x.onreadystatechange=function(){if(x.readyState===4&&x.status===200){
+    try{data=JSON.parse(x.responseText);}catch(e){}render();}};
+  x.send();};
+function indexOf(a,v){for(var i=0;i<a.length;i++)if(a[i]===v)return i;return -1;}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/"/g,'&quot;');}
+function fmt(n){if(n>=1e6)return (n/1e6).toFixed(1)+'m';
+  if(n>=1e4)return Math.round(n/1e3)+'k';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'k';return ''+Math.round(n);}
+function mmss(d){d=Math.round(d);var m=Math.floor(d/60),s=d%60;
+  return m+':'+(s<10?'0':'')+s;}
+function color(name){var h=0;
+  for(var i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0;
+  return 'hsl('+(h%360)+',45%,38%)';}
+function poll(){var x=new XMLHttpRequest();
+  x.open('GET','/data',true);
+  x.onreadystatechange=function(){if(x.readyState===4){
+    if(x.status===200){try{data=JSON.parse(x.responseText);}catch(e){}render();}
+    setTimeout(poll,250);}};
+  x.send();}
+function render(){
+  $('bView').textContent=VIEW_LBL[view];
+  $('bMode').textContent=MODE_LBL[mode];
+  var rowsEl=$('rows');
+  if(!data){return;}
+  var enc=data[view], idle='';
+  if(!enc&&view==='current'&&data.last){enc=data.last;idle=' idle';}
+  if(!enc){rowsEl.innerHTML='<div id="empty">no data yet</div>';
+    $('meta').textContent='';return;}
+  var dur=enc.dur||1;
+  var fresh='';
+  if(data.meta&&data.meta.stale!=null&&data.meta.stale>10)
+    fresh=' ⚠'+Math.round(data.meta.stale)+'s';
+  $('meta').textContent=mmss(dur)+idle+fresh;
+  var arr=[],n,e,v;
+  for(n in enc.entities){e=enc.entities[n];
+    v=mode==='dmg'?e.dmg:mode==='heal'?e.heal:e.taken;
+    if(v>0)arr.push([n,v,e]);}
+  arr.sort(function(a,b){return b[1]-a[1];});
+  if(!arr.length){rowsEl.innerHTML='<div id="empty">'+MODE_LBL[mode]
+    +': nothing yet</div>';return;}
+  var max=arr[0][1],total=0,i;
+  for(i=0;i<arr.length;i++)total+=arr[i][1];
+  var me=(data.meta&&data.meta.player)||'You';
+  var h='';
+  for(i=0;i<arr.length;i++){
+    n=arr[i][0];v=arr[i][1];e=arr[i][2];
+    var pct=Math.round(v*100/total);
+    h+='<div class="row'+(n===me?' me':'')+'" data-n="'+esc(n)+'">'
+      +'<div class="bar" style="width:'+(v*100/max)+'%;background:'+color(n)+'"></div>'
+      +'<div class="lbl"><span class="n">'+(i+1)+'. '+esc(n)+'</span>'
+      +'<span>'+fmt(v)+' ('+fmt(v/dur)+', '+pct+'%)</span></div></div>';
+    if(open[n]&&mode==='dmg'&&e.abil){
+      var abs=[],ab;
+      for(ab in e.abil)abs.push([ab,e.abil[ab]]);
+      abs.sort(function(a,b){return b[1]-a[1];});
+      for(var j=0;j<abs.length&&j<6;j++)
+        h+='<div class="abil">'+esc(abs[j][0])+' &mdash; '+fmt(abs[j][1])+'</div>';
+      h+='<div class="abil">'+e.hits+' hits, '+e.crits+' crits, max '
+        +fmt(e.max)+'</div>';
+    }
+  }
+  rowsEl.innerHTML=h;
+  var rs=rowsEl.getElementsByClassName('row');
+  for(i=0;i<rs.length;i++){rs[i].onclick=function(){
+    var k=this.getAttribute('data-n');open[k]=!open[k];render();};}
+}
+poll();
+</script></body></html>
