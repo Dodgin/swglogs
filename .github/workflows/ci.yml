@@ -23,7 +23,7 @@ jobs:
       matrix:
         toolchain: [stable, "1.86"] # 1.86 = rust-version in Cargo.toml
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -61,7 +61,7 @@ jobs:
 
       - name: Upload swglogs.exe
         if: matrix.toolchain == 'stable'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: swglogs-windows-x64
           path: target/release/swglogs.exe
@@ -73,7 +73,7 @@ jobs:
     name: Linux (std-only console build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -87,12 +87,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: swglogs-windows-x64
           path: dist
       - name: Attach swglogs.exe to the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/swglogs.exe
           generate_release_notes: true
