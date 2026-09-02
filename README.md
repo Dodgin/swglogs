@@ -57,7 +57,7 @@ cursor mode — otherwise the client hides every window in shoot mode — and so
 its close button is no longer the window's Escape-key cancel button, so
 spamming Escape in a fight doesn't close the meter (the X still works). A
 backup is kept as `ui_pda.inc.pre-swglogs`; the change applies from the next game
-start. `--no-ui-patch` disables it.
+start. With no loose file at all (a stock install, or a UI mod that doesn't ship this page) swglogs writes one from the copy of Legends' page bundled in the exe (`assets/ui_pda.inc`, the page as shipped in the client, the same thing UI mods distribute), already patched. The window and the meter page report what happened. `--no-ui-patch` disables it; `--restore-ui` undoes it (backup back, or our file removed).
 
 ## The window
 
@@ -121,7 +121,11 @@ away:
 spam settings: set **Combat Spam** to **Verbose** (not Brief), turn on **Show
 Weapon** (basic attacks are then labeled with the weapon), and set the combat
 spam **filter** to include your group if you want a group meter. Show Damage
-Detail and Show Armor Absorption are optional. Verbose lines name the ability
+Detail and Show Armor Absorption are optional. Chat timestamps (the
+`HH:MM:SS` prefix on every line) are fine either way: they are stripped, and
+the chatlog source uses them — together with the file's `Logging In [date]`
+markers — as the real time of each line, so `--replay` of an old log keeps
+its true timing and encounter breaks. Verbose lines name the ability
 on every hit, which is the only way damage can be attributed; brief lines
 ("Shootin hits a kwi 500 pts") still count as damage but land in a plain
 "attack" bucket.
@@ -141,7 +145,10 @@ on every hit, which is the only way damage can be attributed; brief lines
 
 ## Assets
 
-`assets/` holds the icon (`swglogs-icon.svg` + PNG renders, `favicon.ico`).
+`assets/` holds the icon (`swglogs-icon.svg` + PNG renders, `favicon.ico`)
+and `ui_pda.inc`, Legends' in-game PDA/browser UI page as shipped in the
+client, bundled so the browser-window fix can be installed where no loose
+copy exists (see The window).
 Everything ships inside the single exe: `build.rs` embeds `assets/swglogs.ico`
 as the executable's icon (generate it with `python assets/gen_ico.py` after
 changing the source PNG) together with the UAC manifest, the window icon is

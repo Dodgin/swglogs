@@ -29,6 +29,8 @@ pub struct Config {
     pub ui_patch: bool,
     /// Console only: never open the desktop window.
     pub headless: bool,
+    /// Undo the UI patch and exit.
+    pub restore_ui: bool,
 }
 
 impl Default for Config {
@@ -48,6 +50,7 @@ impl Default for Config {
             game_dir: None,
             ui_patch: true,
             headless: false,
+            restore_ui: false,
         }
     }
 }
@@ -80,6 +83,7 @@ pub fn parse_args() -> Config {
             "--game-dir" => a.game_dir = Some(PathBuf::from(next(&mut i))),
             "--no-ui-patch" => a.ui_patch = false,
             "--headless" => a.headless = true,
+            "--restore-ui" => a.restore_ui = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -111,6 +115,7 @@ pub fn print_help() {
                         patched so the /browser window stays open in shoot mode\n\
                         and ignores Escape\n\
          --no-ui-patch  skip that patch\n\
+         --restore-ui   undo it (put the backup back / remove our file) and exit\n\
          --headless     console only, don't open the window\n\n\
          In game:  /browser http://127.0.0.1:8666/   (also /healing, /taken)"
     );
@@ -150,6 +155,13 @@ pub fn install_exit_after() {
     }
 }
 
+/// `--restore-ui`: undo the UI patch in the resolved game directory.
+pub fn restore_ui(cfg: &Config) -> Result<String, String> {
+    let (gdir, how) = game_dir(cfg);
+    println!("[swglogs] game directory: {} ({})", gdir.display(), how);
+    uipatch::restore(&gdir)
+}
+
 /// Handles to a running meter.
 pub struct Running {
     pub meter: Arc<Mutex<Meter>>,
@@ -183,11 +195,13 @@ pub fn start(cfg: &Config) -> Running {
     let from_client = how.starts_with("folder of");
     // profiles live under the game dir unless the user said otherwise
     let profiles = if from_client && !cfg.profiles_explicit { gdir.join("profiles") } else { cfg.profiles.clone() };
-    let notice = apply_ui_patch(cfg, &gdir);
+    let (notice, ui_status) = apply_ui_patch(cfg, &gdir);
 
     let meter = Arc::new(Mutex::new(Meter::new(cfg.gap, cfg.player.clone())));
-    if let Some(n) = notice {
-        meter.lock().unwrap().notice = Some(n);
+    {
+        let mut m = meter.lock().unwrap();
+        m.notice = notice;
+        m.ui_status = ui_status;
     }
 
     // Started before the game? Once the client appears, patch ITS folder if
@@ -200,9 +214,12 @@ pub fn start(cfg: &Config) -> Running {
             if let Some(dir) = sources::memory::client_exe_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
                 if dir != gdir {
                     println!("[swglogs] game client found in {} — checking its ui\\ui_pda.inc", dir.display());
-                    if let Some(n) = apply_ui_patch(&cfg2, &dir) {
-                        meter2.lock().unwrap().notice = Some(n);
+                    let (n, st) = apply_ui_patch(&cfg2, &dir);
+                    let mut m = meter2.lock().unwrap();
+                    if n.is_some() {
+                        m.notice = n;
                     }
+                    m.ui_status = st;
                 }
                 return;
             }
@@ -260,13 +277,14 @@ pub fn start(cfg: &Config) -> Running {
 
 /// Make sure the game's `/browser` window survives action mode (see
 /// `uipatch`). Returns a notice for the meter page when an already-running
-/// client still has the old file loaded and must be restarted.
-fn apply_ui_patch(cfg: &Config, game_dir: &std::path::Path) -> Option<Notice> {
+/// client still has the old file loaded and must be restarted, plus a short
+/// status line for the window / meter page.
+fn apply_ui_patch(cfg: &Config, game_dir: &std::path::Path) -> (Option<Notice>, String) {
     if !cfg.ui_patch {
-        return None;
+        return (None, "skipped (--no-ui-patch)".to_string());
     }
     match uipatch::ensure_sticky_browser(game_dir) {
-        Ok(uipatch::Outcome::AlreadySet) => None,
+        Ok(uipatch::Outcome::AlreadySet) => (None, format!("in place ({}\\ui\\ui_pda.inc)", game_dir.display())),
         Ok(uipatch::Outcome::Patched(backup)) => {
             println!(
                 "[swglogs] patched {}\\ui\\ui_pda.inc so the /browser meter stays open in action mode \
@@ -281,24 +299,37 @@ fn apply_ui_patch(cfg: &Config, game_dir: &std::path::Path) -> Option<Notice> {
             // Only a client that is ALREADY running has the old file loaded; a
             // client launched later reads the patched one. Show the banner on
             // the meter page until that client process is gone.
-            sources::memory::client_pid().map(|pid| Notice {
+            let notice = sources::memory::client_pid().map(|pid| Notice {
                 text: "UI patched \u{2014} restart the game client for this meter to stay open in action mode."
                     .to_string(),
                 client_pid: Some(pid),
-            })
+            });
+            (notice, format!("applied to {}\\ui\\ui_pda.inc (restart the game once)", game_dir.display()))
         }
-        Ok(uipatch::Outcome::NoLooseFile) => {
+        Ok(uipatch::Outcome::Installed) => {
             println!(
-                "[swglogs] no loose ui\\ui_pda.inc in {} — the /browser window will hide in shoot mode. \
-                 Extract ui/ui_pda.inc from the game's TRE files into {}\\ui\\ and rerun, or pass --no-ui-patch.",
+                "[swglogs] no loose ui\\ui_pda.inc in {} — wrote swglogs' bundled copy of the page ({}), \
+                 already patched, so the /browser meter stays open in action mode and ignores Escape.",
                 game_dir.display(),
-                game_dir.display()
+                uipatch::EMBEDDED_VERSION
             );
-            None
+            println!(
+                "[swglogs] *** RESTART THE GAME CLIENT *** — the UI file is read at launch. \
+                 `swglogs --restore-ui` removes the file again."
+            );
+            let notice = sources::memory::client_pid().map(|pid| Notice {
+                text: "UI patched \u{2014} restart the game client for this meter to stay open in action mode."
+                    .to_string(),
+                client_pid: Some(pid),
+            });
+            (
+                notice,
+                format!("installed swglogs' copy of the page at {}\\ui\\ui_pda.inc (restart the game once)", game_dir.display()),
+            )
         }
         Err(e) => {
             eprintln!("[swglogs] ui patch skipped: {}", e);
-            None
+            (None, format!("NOT applied: {}", e))
         }
     }
 }

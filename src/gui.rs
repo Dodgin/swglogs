@@ -38,9 +38,9 @@ impl eframe::App for App {
 impl App {
     fn logging(&self, ui: &mut egui::Ui) {
         let server_error = self.running.server_error.lock().unwrap().clone();
-        let (source, notice) = {
+        let (source, notice, ui_status) = {
             let m = self.running.meter.lock().unwrap();
-            (m.log_path.clone(), m.notice.as_ref().map(|n| n.text.clone()))
+            (m.log_path.clone(), m.notice.as_ref().map(|n| n.text.clone()), m.ui_status.clone())
         };
 
         ui.add_space(8.0);
@@ -57,6 +57,14 @@ impl App {
         }
         if !source.is_empty() {
             ui.label(egui::RichText::new(source).small().weak());
+        }
+        if !ui_status.is_empty() {
+            let line = format!("In-game window patch: {}", ui_status);
+            if ui_status.starts_with("NOT") {
+                ui.colored_label(egui::Color32::GOLD, egui::RichText::new(line).small());
+            } else {
+                ui.label(egui::RichText::new(line).small().weak());
+            }
         }
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Make an in game macro:").strong());

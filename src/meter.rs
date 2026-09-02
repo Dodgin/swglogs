@@ -87,6 +87,9 @@ pub struct Meter {
     unparsed: VecDeque<String>,
     pub notice: Option<Notice>,
     notice_checked: f64,
+    /// Outcome of the in-game browser UI patch, shown in the window and on
+    /// the meter page (window-mode users never see the console).
+    pub ui_status: String,
 }
 
 impl Meter {
@@ -110,6 +113,7 @@ impl Meter {
             unparsed: VecDeque::new(),
             notice: None,
             notice_checked: 0.0,
+            ui_status: String::new(),
         }
     }
 
@@ -252,7 +256,7 @@ impl Meter {
         format!(
             "{{\"current\":{},\"last\":{},\"overall\":{},\"meta\":{{\
              \"player\":{},\"stale\":{},\"encounters\":{},\"events\":{},\
-             \"lines\":{},\"unparsed\":{},\"log\":{},\"notice\":{},\"now\":{:.3}}}}}",
+             \"lines\":{},\"unparsed\":{},\"log\":{},\"notice\":{},\"ui\":{},\"now\":{:.3}}}}}",
             cur.unwrap_or_else(|| "null".to_string()),
             last.unwrap_or_else(|| "null".to_string()),
             overall,
@@ -264,6 +268,7 @@ impl Meter {
             self.unparsed.len(),
             json_str(&self.log_path),
             self.notice.as_ref().map(|n| json_str(&n.text)).unwrap_or_else(|| "null".to_string()),
+            json_str(&self.ui_status),
             now_secs(),
         )
     }
@@ -294,6 +299,11 @@ impl Meter {
         if let Some(n) = &self.notice {
             s.push_str("notice: ");
             s.push_str(&n.text);
+            s.push('\n');
+        }
+        if !self.ui_status.is_empty() {
+            s.push_str("ui patch: ");
+            s.push_str(&self.ui_status);
             s.push('\n');
         }
         s.push_str(&format!("damage lines: {} verbose, {} terse\n", self.verbose_hits, self.terse_hits));

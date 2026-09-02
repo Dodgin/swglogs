@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::event::{EntityKind, Event, Kind, Outcome};
 use crate::logwriter::LogWriter;
 use crate::meter::{now_secs, Meter};
-use crate::parse::{parse_line_colored, Parsed};
+use crate::parse::{line_time_of_day, login_epoch, parse_line_colored, Parsed};
 
 /// Fan-out target: parse+meter+log. Cloneable handle over shared state.
 #[derive(Clone)]
@@ -104,7 +104,75 @@ fn read_dirs(p: &Path) -> Vec<PathBuf> {
 
 /// Tail the newest chatlog (or a fixed file), forever. If `replay`, parse the
 /// existing file from the top on first open; otherwise start at the end.
+/// Turns the chatlog's own clock into Unix time: the session's `Logging In
+/// [date time]` marker gives the date, each line's `HH:MM:SS` prefix (chat
+/// timestamps on) the time of day. Without either, ingestion time is used.
+struct ChatClock {
+    /// local midnight of the current session's date, as UTC seconds
+    day_base: Option<i64>,
+    last_tod: u32,
+    utc_offset: i64,
+}
+
+impl ChatClock {
+    fn new() -> Self {
+        ChatClock { day_base: None, last_tod: 0, utc_offset: local_utc_offset_secs() }
+    }
+
+    /// Timestamp for `line`: the line's own clock when known, else `now`.
+    fn stamp(&mut self, line: &str, now: f64) -> f64 {
+        if let Some(login) = login_epoch(line, self.utc_offset) {
+            // midnight (local) of that date, in UTC seconds
+            let local = login + self.utc_offset;
+            self.day_base = Some(local - local.rem_euclid(86_400) - self.utc_offset);
+            self.last_tod = (local.rem_euclid(86_400)) as u32;
+            return login as f64;
+        }
+        match (line_time_of_day(line), self.day_base) {
+            (Some(tod), Some(base)) => {
+                // past midnight since the last line? roll the day
+                if tod + 6 * 3600 < self.last_tod {
+                    self.day_base = Some(base + 86_400);
+                }
+                self.last_tod = tod;
+                (self.day_base.unwrap() + tod as i64) as f64
+            }
+            _ => now,
+        }
+    }
+}
+
+/// Seconds to add to UTC to get local time (Windows: from the system's
+/// current time-zone setting, DST included; elsewhere 0).
+fn local_utc_offset_secs() -> i64 {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct TzInfo {
+            bias: i32,
+            standard_name: [u16; 32],
+            standard_date: [u16; 8],
+            standard_bias: i32,
+            daylight_name: [u16; 32],
+            daylight_date: [u16; 8],
+            daylight_bias: i32,
+        }
+        extern "system" {
+            fn GetTimeZoneInformation(tzi: *mut TzInfo) -> u32;
+        }
+        unsafe {
+            let mut tzi: TzInfo = std::mem::zeroed();
+            let r = GetTimeZoneInformation(&mut tzi);
+            let bias = tzi.bias + if r == 2 { tzi.daylight_bias } else { tzi.standard_bias };
+            return -(bias as i64) * 60;
+        }
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
 pub fn chatlog_tail(sink: Sink, profiles: PathBuf, fixed: Option<PathBuf>, replay: bool) {
+    let mut clock = ChatClock::new();
     let mut path: Option<PathBuf> = None;
     let mut file: Option<fs::File> = None;
     let mut first = true;
@@ -141,11 +209,13 @@ pub fn chatlog_tail(sink: Sink, profiles: PathBuf, fixed: Option<PathBuf>, repla
             let mut chunk = String::new();
             if f.read_to_string(&mut chunk).is_ok() && !chunk.is_empty() {
                 carry.push_str(&chunk);
-                let ts = now_secs();
+                let now = now_secs();
+                let mut ts = now;
                 let mut consumed = 0;
                 while let Some(nl) = carry[consumed..].find('\n') {
                     let line = carry[consumed..consumed + nl].to_string();
                     consumed += nl + 1;
+                    ts = clock.stamp(&line, now);
                     sink.line(&line, ts);
                 }
                 carry.drain(..consumed);

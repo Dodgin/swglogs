@@ -92,19 +92,112 @@ fn parse_int_prefix(s: &str) -> Option<(u64, usize)> {
     }
 }
 
-/// Strip a leading channel tag. Returns (body, was_combat_channel).
-/// `None` body means: skip this line.
+/// With the client's chat timestamps on, every line starts with `HH:MM:SS `
+/// (24-hour; also tolerated: `[HH:MM:SS]`, `(HH:MM:SS)`, `HH:MM`, a trailing
+/// AM/PM). Returns the time of day in seconds and the rest of the line.
+pub fn split_timestamp(s: &str) -> (Option<u32>, &str) {
+    let t = s.trim_start();
+    let inner = t.trim_start_matches(|c| c == '[' || c == '(');
+    let digits = |x: &str| x.chars().take_while(|c| c.is_ascii_digit()).count();
+    let h = digits(inner);
+    if h == 0 || h > 2 || !inner[h..].starts_with(':') {
+        return (None, s);
+    }
+    let rest = &inner[h + 1..];
+    let m = digits(rest);
+    if m != 2 {
+        return (None, s);
+    }
+    let mut end = h + 1 + m;
+    let mut secs = 0u32;
+    if rest[m..].starts_with(':') && digits(&rest[m + 1..]) == 2 {
+        secs = rest[m + 1..m + 3].parse().unwrap_or(0);
+        end += 3;
+    }
+    let mut hour: u32 = inner[..h].parse().unwrap_or(0);
+    let minute: u32 = rest[..m].parse().unwrap_or(0);
+    let mut tail = inner[end..].trim_start_matches(|c| c == ']' || c == ')');
+    let low = tail.trim_start().to_ascii_lowercase();
+    if low.starts_with("pm") || low.starts_with("am") {
+        let pm = low.starts_with("pm");
+        tail = tail.trim_start()[2..].trim_start_matches(|c| c == ']' || c == ')');
+        if pm && hour < 12 {
+            hour += 12;
+        } else if !pm && hour == 12 {
+            hour = 0;
+        }
+    }
+    // must be followed by whitespace (a real prefix), not glued to text
+    if !tail.starts_with(char::is_whitespace) {
+        return (None, s);
+    }
+    if hour > 23 || minute > 59 || secs > 59 {
+        return (None, s);
+    }
+    (Some(hour * 3600 + minute * 60 + secs), tail.trim_start())
+}
+
+/// Time of day of a chatlog line, whether the `HH:MM:SS` sits before or
+/// after the `[Channel]` tag.
+pub fn line_time_of_day(line: &str) -> Option<u32> {
+    let t = line.trim_start_matches('\u{feff}').trim();
+    if let (Some(tod), _) = split_timestamp(t) {
+        return Some(tod);
+    }
+    let rest = t.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    split_timestamp(rest[end + 1..].trim()).0
+}
+
+/// The chatlog's session marker, `Logging In [Wed Sep  2 17:16:35 2026] `:
+/// the local date+time as Unix seconds given the local UTC offset, so a
+/// following `HH:MM:SS` line prefix can be turned into a real timestamp.
+pub fn login_epoch(line: &str, utc_offset_secs: i64) -> Option<i64> {
+    let t = line.trim_start_matches('\u{feff}').trim();
+    let inside = t.strip_prefix("Logging In")?.trim().strip_prefix('[')?;
+    let inside = &inside[..inside.find(']')?];
+    let f: Vec<&str> = inside.split_whitespace().collect();
+    if f.len() != 5 {
+        return None;
+    }
+    let mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        .iter()
+        .position(|m| f[1].to_ascii_lowercase().starts_with(m))? as i64
+        + 1;
+    let day: i64 = f[2].parse().ok()?;
+    let year: i64 = f[4].parse().ok()?;
+    let hms: Vec<i64> = f[3].split(':').filter_map(|x| x.parse().ok()).collect();
+    if hms.len() != 3 {
+        return None;
+    }
+    Some(days_from_civil(year, mon, day) * 86_400 + hms[0] * 3600 + hms[1] * 60 + hms[2] - utc_offset_secs)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Strip a leading channel tag (and a chat timestamp before or after it).
+/// Returns (body, was_combat_channel). `None` body means: skip this line.
 fn strip_channel(line: &str) -> Option<(String, bool)> {
     let t = line.trim_start_matches('\u{feff}').trim();
+    let (_, t) = split_timestamp(t);
     if t.is_empty() {
         return None;
     }
     if let Some(rest) = t.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             let chan = rest[..end].trim().to_ascii_lowercase();
-            let body = rest[end + 1..].trim().to_string();
+            let (_, body) = split_timestamp(rest[end + 1..].trim());
             let is_combat = chan == "combat";
-            return Some((body, is_combat));
+            return Some((body.trim().to_string(), is_combat));
         }
     }
     // Untagged line (e.g. from the IPC ring, already de-tagged). Treat as combat

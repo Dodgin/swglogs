@@ -12,9 +12,13 @@
 //! spamming Escape in a fight no longer kills the meter.
 //!
 //! On startup we look for a loose `ui/ui_pda.inc` in the game directory and
-//! apply both changes if they are missing (keeping a backup). The client reads UI files at launch, so the change applies from
-//! the next game start. Without a loose file (stock install: the page lives
-//! inside a TRE archive) we only print how to get one.
+//! apply both changes if they are missing (keeping a backup). Without a
+//! loose file — a stock install, or a UI mod that does not ship this page —
+//! we write one from the copy of Legends' page bundled in the exe (the way
+//! UI mods distribute these files), already patched. The client reads UI
+//! files at launch, so either change applies from the next game start.
+//! `--restore-ui` undoes it: the backup goes back, or the file we created is
+//! removed.
 
 use std::fs;
 use std::path::Path;
@@ -24,11 +28,23 @@ pub enum Outcome {
     AlreadySet,
     /// File rewritten; backup at the given path.
     Patched(String),
-    /// No loose `ui/ui_pda.inc` to patch.
-    NoLooseFile,
+    /// No loose `ui/ui_pda.inc` existed; the bundled, pre-patched page was
+    /// written there.
+    Installed,
 }
 
 const ATTR: &str = "StickyVisible='true'";
+
+/// Legends' `ui/ui_pda.inc` as shipped in the client (`EMBEDDED_VERSION`
+/// says which), unmodified; patched at write time by the same code that
+/// patches a user's own file.
+pub const EMBEDDED: &str = include_str!("../assets/ui_pda.inc");
+pub const EMBEDDED_VERSION: &str = "SWG Legends client 26.08.16 (page captured 2026-09-02)";
+
+/// The bundled page with both fixes applied.
+pub fn embedded_patched() -> String {
+    patch_text(EMBEDDED).unwrap_or_else(|| EMBEDDED.to_string())
+}
 
 /// Apply every browser-window fix that is missing. None = nothing to change
 /// (or no WebBrowser page found).
@@ -101,11 +117,18 @@ fn patch_sticky(src: &str) -> Option<String> {
     Some(out)
 }
 
-/// Ensure the game's loose `ui/ui_pda.inc` marks the browser window sticky.
+/// Ensure the game's loose `ui/ui_pda.inc` marks the browser window sticky
+/// and off the Escape key — patching the user's file, or writing ours.
 pub fn ensure_sticky_browser(game_dir: &Path) -> Result<Outcome, String> {
-    let path = game_dir.join("ui").join("ui_pda.inc");
+    let ui = game_dir.join("ui");
+    let path = ui.join("ui_pda.inc");
     if !path.is_file() {
-        return Ok(Outcome::NoLooseFile);
+        if !game_dir.is_dir() {
+            return Err(format!("{} is not a directory", game_dir.display()));
+        }
+        fs::create_dir_all(&ui).map_err(|e| format!("create {}: {}", ui.display(), e))?;
+        fs::write(&path, embedded_patched().as_bytes()).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        return Ok(Outcome::Installed);
     }
     let bytes = fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let src = String::from_utf8_lossy(&bytes);
@@ -127,8 +150,35 @@ pub fn ensure_sticky_browser(game_dir: &Path) -> Result<Outcome, String> {
     Ok(Outcome::Patched(backup.display().to_string()))
 }
 
+/// Undo: put the backup back if there is one, else remove the file if it is
+/// the one we wrote (byte-identical to our patched page). A user's own,
+/// hand-edited file is never deleted. Returns what was done.
+pub fn restore(game_dir: &Path) -> Result<String, String> {
+    let path = game_dir.join("ui").join("ui_pda.inc");
+    let backup = path.with_extension("inc.pre-swglogs");
+    if backup.is_file() {
+        fs::rename(&backup, &path).map_err(|e| format!("restore {}: {}", path.display(), e))?;
+        return Ok(format!("restored {} from its pre-swglogs backup", path.display()));
+    }
+    if !path.is_file() {
+        return Ok(format!("nothing to restore: no {}", path.display()));
+    }
+    let current = fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    if current == embedded_patched().as_bytes() {
+        fs::remove_file(&path).map_err(|e| format!("remove {}: {}", path.display(), e))?;
+        return Ok(format!("removed {} (it was swglogs' bundled copy)", path.display()));
+    }
+    Ok(format!("left {} alone: not swglogs' copy and no backup to restore", path.display()))
+}
+
 /// Pure-function checks, run by `swglogs --selftest`.
 pub fn selfcheck(check: &mut dyn FnMut(bool, &str)) {
+    let emb = embedded_patched();
+    check(
+        emb.contains("StickyVisible='true'") && !emb.contains("IsCancelButton='true'\r\n\t\t\t\t\t\tName='close'")
+            && emb.len() > EMBEDDED.len() && patch_text(&emb).is_none(),
+        "uipatch: bundled Legends page patches cleanly and is then a fixed point",
+    );
     let page = "\t\t<Page\r\n\t\t\tName='WebBrowser'\r\n\t\t>\r\n\t\t\t<Data\r\n\t\t\t\tback='buttonBack'\r\n\t\t\t\tbrowserimage='webBrowserControl.webBrowserScreen'\r\n\t\t\t\tName='CodeData'\r\n\t\t\t/>\r\n\t\t</Page>\r\n";
     let out = patch_text(page).unwrap_or_default();
     check(

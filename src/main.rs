@@ -26,6 +26,18 @@ fn main() {
     if cfg.selftest {
         std::process::exit(selftest::run());
     }
+    if cfg.restore_ui {
+        match app::restore_ui(&cfg) {
+            Ok(msg) => {
+                println!("[swglogs] {}", msg);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("[swglogs] restore failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     let running = app::start(&cfg);
 
@@ -94,6 +106,9 @@ mod selftest {
         "[Combat]  Yourname performs Cryoban Grenade 2.",
         "[Combat]  Yourname attacks a giant baz nitch with Cryoban Grenade 2 and hits for 100 points (100 acid).",
         "[Combat]  Yourname heals Yourname for 50 points of damage.",
+        // chat timestamps on: "HH:MM:SS " before the text (also seen before the tag)
+        "[Combat]  18:05:34 Yourname attacks a bull bantha and hits for 1881 points (1414 kinetic and 467 heat)",
+        "18:05:35 [Combat]  A bull bantha attacks Yourname and hits for 200 points (200 kinetic).",
         "[Combat]  That target is out of range.",
         "[Combat]  Some future spam variant dealing 999 mystery hurt",
     ];
@@ -122,10 +137,13 @@ mod selftest {
 
         // Yourname dmg: 844+973+1302+581(DoT)+337(glance)+500 = 4537
         let verbose_out = 1179 + 454 + 489 + 545 + 100;
-        check(field(&snap, "Yourname", "dmg") == 844 + 973 + 1302 + 581 + 337 + 500 + 250 + verbose_out,
+        check(field(&snap, "Yourname", "dmg") > 0 && field(&snap, "Bull bantha", "taken") == 1881 && field(&snap, "Bull bantha", "dmg") == 200
+                  && !snap.contains("18:05:3"),
+              "chat timestamps: 'HH:MM:SS ' prefix stripped (before or after the tag), no time in names");
+        check(field(&snap, "Yourname", "dmg") == 844 + 973 + 1302 + 581 + 337 + 500 + 250 + verbose_out + 1881,
               "Yourname damage incl. glance + DoT + post-perform hit");
         check(field(&snap, "Yourname", "crits") == 1, "Yourname crit counted");
-        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296 + 159 + 151,
+        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296 + 159 + 151 + 200,
               "Yourname taken incl. strikes-through + poison tick + verbose hits");
         check(field(&snap, "Yourname", "avoids") == 2, "Yourname misses counted (terse + verbose)");
         check(field(&snap, "Giant baz nitch", "taken") == verbose_out && field(&snap, "Giant baz nitch", "dmg") == 159 + 151,
@@ -150,6 +168,18 @@ mod selftest {
         check(has_ability(&snap, "Yourname", "fire damage"), "DoT labeled 'fire damage'");
         check(!has_ability(&snap, "Yourname", "Heal 4"), "hit after 'performs Heal 4' is NOT labeled as the heal");
         check(fmt_ts(1_756_744_800.0).starts_with("2025-"), "fmt_ts civil date sane");
+        {
+            use swglogs::parse::{login_epoch, split_timestamp};
+            check(split_timestamp("18:05:34 Yourname attacks") == (Some(18 * 3600 + 5 * 60 + 34), "Yourname attacks")
+                      && split_timestamp("[6:05 PM] x") == (Some(18 * 3600 + 5 * 60), "x")
+                      && split_timestamp("Yourname hits a kwi 12:30 pts") == (None, "Yourname hits a kwi 12:30 pts")
+                      && split_timestamp("1200:00 x") == (None, "1200:00 x"),
+                  "split_timestamp: 24h / 12h / bracketed; untouched when not a prefix");
+            let e = login_epoch("Logging In [Wed Sep  2 17:16:35 2026] ", 0).unwrap_or(0);
+            check(fmt_ts(e as f64) == "2026-09-02T17:16:35Z", "login_epoch parses the chatlog session marker");
+            check(login_epoch("Logging In [Wed Sep  2 17:16:35 2026] ", -4 * 3600) == Some(e + 4 * 3600),
+                  "login_epoch applies the local UTC offset");
+        }
         swglogs::sources::memory::selfcheck(&mut check);
         swglogs::uipatch::selfcheck(&mut check);
         {

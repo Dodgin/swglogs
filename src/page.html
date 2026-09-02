@@ -98,6 +98,7 @@ function render(){
   var rowsEl=$('rows');
   if(!data){$('meta').textContent=stats();return;}
   var nt=$('notice'),msg=data.meta&&data.meta.notice;
+  if(data.meta&&data.meta.ui&&data.meta.ui.indexOf('NOT')===0)msg=(msg?msg+' \u2014 ':'')+'In-game window patch '+data.meta.ui;
   nt.style.display=msg?'block':'none';if(msg)nt.textContent=msg;
   var enc=data[view], idle='';
   if(!enc&&view==='current'&&data.last){enc=data.last;idle=' idle';}
