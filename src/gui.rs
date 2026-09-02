@@ -38,7 +38,10 @@ impl eframe::App for App {
 impl App {
     fn logging(&self, ui: &mut egui::Ui) {
         let server_error = self.running.server_error.lock().unwrap().clone();
-        let notice = self.running.meter.lock().unwrap().notice.as_ref().map(|n| n.text.clone());
+        let (source, notice) = {
+            let m = self.running.meter.lock().unwrap();
+            (m.log_path.clone(), m.notice.as_ref().map(|n| n.text.clone()))
+        };
 
         ui.add_space(8.0);
         match server_error {
@@ -51,6 +54,9 @@ impl App {
             None => {
                 ui.heading("SWG Logs is running");
             }
+        }
+        if !source.is_empty() {
+            ui.label(egui::RichText::new(source).small().weak());
         }
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Make an in game macro:").strong());

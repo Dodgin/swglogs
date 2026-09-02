@@ -62,6 +62,8 @@ function poll(){var x=new XMLHttpRequest();
     if(x.status===200){try{data=JSON.parse(x.responseText);}catch(e){}render();}
     setTimeout(poll,250);}};
   x.send();}
+function src(){var l=data&&data.meta&&data.meta.log;
+  return l?'<br><span style="font-size:10px">'+esc(l)+'</span>':'';}
 function render(){
   $('bView').textContent=VIEW_LBL[view];
   $('bMode').textContent=MODE_LBL[mode];
@@ -71,7 +73,7 @@ function render(){
   nt.style.display=msg?'block':'none';if(msg)nt.textContent=msg;
   var enc=data[view], idle='';
   if(!enc&&view==='current'&&data.last){enc=data.last;idle=' idle';}
-  if(!enc){rowsEl.innerHTML='<div id="empty">no data yet</div>';
+  if(!enc){rowsEl.innerHTML='<div id="empty">no data yet'+src()+'</div>';
     $('meta').textContent='';return;}
   var dur=enc.dur||1;
   var fresh='';
@@ -84,7 +86,7 @@ function render(){
     if(v>0)arr.push([n,v,e]);}
   arr.sort(function(a,b){return b[1]-a[1];});
   if(!arr.length){rowsEl.innerHTML='<div id="empty">'+MODE_LBL[mode]
-    +': nothing yet</div>';return;}
+    +': nothing yet'+src()+'</div>';return;}
   var max=arr[0][1],total=0,i;
   for(i=0;i<arr.length;i++)total+=arr[i][1];
   var me=(data.meta&&data.meta.player)||'You';
