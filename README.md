@@ -66,6 +66,12 @@ are coming. `--headless` skips the window (console only); when started from a
 terminal the exe attaches to it so `--headless`, `--selftest` and `--help`
 print normally.
 
+The exe always asks for Administrator (an embedded UAC manifest): the memory
+source has to open the elevated game client, so this saves a right-click. It
+applies to every mode, `--headless` and `--selftest` included. From an
+un-elevated `cmd.exe` Windows refuses to start it ("requires elevation");
+PowerShell and Explorer show the UAC prompt.
+
 The window is Cargo feature `gui` (on by default; pulls in `eframe`/`egui`).
 `cargo build --release --no-default-features` gives a std-only console build
 that needs no registry access.
@@ -116,8 +122,9 @@ away:
 `assets/` holds the icon (`swglogs-icon.svg` + PNG renders, `favicon.ico`).
 Everything ships inside the single exe: `build.rs` embeds `assets/swglogs.ico`
 as the executable's icon (generate it with `python assets/gen_ico.py` after
-changing the source PNG), the window icon is the 256 px PNG via
-`include_bytes!`, and the meter page serves `favicon.ico` from the binary.
+changing the source PNG) together with the UAC manifest, the window icon is
+the 256 px PNG via `include_bytes!`, and the meter page serves `favicon.ico`
+from the binary.
 
 ## Layout
 
