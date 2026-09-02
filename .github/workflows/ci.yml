@@ -59,12 +59,24 @@ jobs:
           print(f"{found}/{n} icon images embedded")
           assert found == n, "icon resource missing from swglogs.exe"
 
+      - name: Name the exe (swglogs-v<version>-<shorthash>.exe)
+        if: matrix.toolchain == 'stable'
+        id: name
+        shell: bash
+        run: |
+          # version from Cargo.toml, a trailing ".0" patch dropped, dots -> underscores: 1.0.0 -> v1_0
+          ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/; s/\.0$//; s/\./_/g')
+          name="swglogs-v${ver}-${GITHUB_SHA::7}"
+          mkdir -p dist && cp target/release/swglogs.exe "dist/${name}.exe"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "artifact: ${name}.exe"
+
       - name: Upload swglogs.exe
         if: matrix.toolchain == 'stable'
         uses: actions/upload-artifact@v7
         with:
-          name: swglogs-windows-x64
-          path: target/release/swglogs.exe
+          name: ${{ steps.name.outputs.name }}
+          path: dist/${{ steps.name.outputs.name }}.exe
           if-no-files-found: error
 
   linux-std-only:
@@ -89,10 +101,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: swglogs-windows-x64
+          pattern: swglogs-v*
+          merge-multiple: true
           path: dist
-      - name: Attach swglogs.exe to the GitHub release
+      - name: Attach the exe to the GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/swglogs.exe
+          files: dist/swglogs-v*.exe
           generate_release_notes: true
