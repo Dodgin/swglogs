@@ -71,10 +71,12 @@ impl Outcome {
     }
 }
 
-/// Player or NPC. Judged from how the name appears in the line — NPC names
-/// arrive with an article or in lowercase ("a kwi", "an elder mamien"),
-/// player names are bare and capitalized — and, for the local player's own
-/// lines, pinned by the line's color (see [`color_role`]).
+/// Player or NPC. From the line text, an article or lowercase name is an NPC
+/// and "You" is the player; a bare capitalized name proves nothing (humanoid
+/// NPCs are Title Case too). The line's color pins the local player's end
+/// (see [`color_role`]); the meter then adds a weaker vote for the OTHER end
+/// of your own lines — what you hit, and what hits you, is an enemy, an NPC
+/// in PvE — and tallies everything per entity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntityKind {
     Player,

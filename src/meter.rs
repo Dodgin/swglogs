@@ -322,12 +322,18 @@ fn abil_kind_hint(ability: &str) -> Option<Kind> {
     }
 }
 
-fn vote(ents: &mut BTreeMap<String, Ent>, name: &Option<String>, kind: EntityKind) {
+/// Certain evidence (article / lowercase name, "You", the color-pinned end of
+/// your own lines, a heal) weighs 3; the "other end of your own line is an
+/// enemy" inference weighs 1, so a few certain lines always outvote it.
+const STRONG: u32 = 3;
+const WEAK: u32 = 1;
+
+fn vote(ents: &mut BTreeMap<String, Ent>, name: &Option<String>, kind: EntityKind, w: u32) {
     if let Some(n) = name {
         let e = ents.entry(n.clone()).or_default();
         match kind {
-            EntityKind::Player => e.pv += 1,
-            EntityKind::Npc => e.nv += 1,
+            EntityKind::Player => e.pv += w,
+            EntityKind::Npc => e.nv += w,
             EntityKind::Unknown => {}
         }
     }
@@ -335,8 +341,22 @@ fn vote(ents: &mut BTreeMap<String, Ent>, name: &Option<String>, kind: EntityKin
 
 fn apply(ents: &mut BTreeMap<String, Ent>, ev: &Event) {
     if ev.kind != Kind::Ability {
-        vote(ents, &ev.src, ev.src_kind);
-        vote(ents, &ev.tgt, ev.tgt_kind);
+        vote(ents, &ev.src, ev.src_kind, STRONG);
+        vote(ents, &ev.tgt, ev.tgt_kind, STRONG);
+        // The other end of one of YOUR lines is your enemy: an NPC, in PvE.
+        // Weak, so an entity that ever shows player behaviour (heals, gets
+        // healed, is "You") still ends up a player.
+        if ev.kind == Kind::Damage || ev.kind == Kind::Avoid {
+            match ev.color.map(crate::event::color_role) {
+                Some(crate::event::ColorRole::Outgoing) if ev.tgt_kind == EntityKind::Unknown => {
+                    vote(ents, &ev.tgt, EntityKind::Npc, WEAK)
+                }
+                Some(crate::event::ColorRole::Incoming) if ev.src_kind == EntityKind::Unknown => {
+                    vote(ents, &ev.src, EntityKind::Npc, WEAK)
+                }
+                _ => {}
+            }
+        }
     }
     match ev.kind {
         Kind::Damage => {

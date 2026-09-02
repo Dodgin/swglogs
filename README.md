@@ -52,8 +52,10 @@ first, then tail) · `--out FILE` (JSONL log, default `combat-log.jsonl`) ·
 
 On startup swglogs patches the game's loose `ui\ui_pda.inc` (if present) so the
 `/browser` window carries `StickyVisible='true'` and stays open when you leave
-cursor mode — otherwise the client hides every window in shoot mode. A backup
-is kept as `ui_pda.inc.pre-swglogs`; the change applies from the next game
+cursor mode — otherwise the client hides every window in shoot mode — and so
+its close button is no longer the window's Escape-key cancel button, so
+spamming Escape in a fight doesn't close the meter (the X still works). A
+backup is kept as `ui_pda.inc.pre-swglogs`; the change applies from the next game
 start. `--no-ui-patch` disables it.
 
 ## The window
@@ -62,9 +64,11 @@ One executable. Double-clicking `swglogs.exe` opens a 640x480 egui window with
 a single **Logging** tab: whether SWG Logs is running, the in-game `/browser`
 macro to open the meter, and the restart-the-client notice when the UI patch
 just landed. Closing the window stops the meter. More tabs
-are coming. `--headless` skips the window (console only); when started from a
-terminal the exe attaches to it so `--headless`, `--selftest` and `--help`
-print normally.
+are coming. `--headless` skips the window (console only). Launched with any
+flag from a terminal, the exe attaches to that terminal so `--headless`,
+`--selftest` and `--help` print normally; launched bare (double-click, or a
+plain `swglogs.exe`) it stays detached, the prompt comes straight back, and
+closing the window is all it takes to stop it.
 
 The exe always asks for Administrator (an embedded UAC manifest): the memory
 source has to open the elevated game client, so this saves a right-click. It
@@ -80,11 +84,14 @@ that needs no registry access.
 
 **Meter page** — ranked bars, header cycles Now/Last/All and Damage/Healing/
 Taken and Players (default) / NPCs / Everyone. Click a row
-for its ability breakdown (hits/crits/max). Player vs NPC is judged from how
-the name appears in the line (NPC names arrive with an article or lowercase:
-"a kwi", "an elder mamien") and, on the memory source, pinned by the line's
-color — the client colors combat spam from your point of view: green your
-hits, orange your DoT ticks, red hits on you, light blue heals. Shows a `⚠Ns`
+for its ability breakdown (hits/crits/max). Player vs NPC: an article or a
+lowercase name means NPC ("a kwi", "an elder mamien"); the line's color pins
+you (the client colors combat spam from your point of view: green your hits,
+orange your DoT ticks, red hits on you, light blue heals); and whatever you
+hit or get hit by counts as an enemy — an NPC, in PvE — unless it ever shows
+player behaviour (heals, gets healed). Title-case humanoids like "Tusken Relic
+Worshiper" land on the NPC side that way. Group members get no color and stay
+"unknown", which the Players view includes. Shows a `⚠Ns`
 staleness marker when the chatlog hasn't advanced (the game buffers its writes;
 our own log below does not).
 

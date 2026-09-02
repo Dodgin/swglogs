@@ -13,7 +13,14 @@
 use swglogs::app;
 
 fn main() {
-    app::attach_parent_console();
+    // Only a console-style invocation (any flag: --headless, --selftest,
+    // --help, ...) attaches to the launching terminal. A bare launch, from a
+    // double-click or a plain `swglogs.exe`, is window mode: it must not write
+    // over the terminal's prompt, and a Ctrl+C there must not kill the meter
+    // (Ctrl+C goes to every process attached to that console).
+    if std::env::args().len() > 1 {
+        app::attach_parent_console();
+    }
     let cfg = app::parse_args();
     app::install_exit_after();
     if cfg.selftest {
@@ -151,11 +158,11 @@ mod selftest {
                 Parsed::Event(e) => (e.src_kind, e.tgt_kind),
                 _ => (K::Unknown, K::Unknown),
             };
-            check(k("[Combat]  Yourname hits an elder mamien 844 pts", None) == (K::Player, K::Npc),
-                  "kinds: bare capitalized name = player, article = npc");
-            check(k("[Combat]  A crystal snake strikes through Yourname 396 pts", None) == (K::Npc, K::Player),
-                  "kinds: leading article npc -> player");
-            check(k("[Combat]  You have healed Yourname for 3465 points of damage.", None) == (K::Player, K::Player),
+            check(k("[Combat]  Yourname hits an elder mamien 844 pts", None) == (K::Unknown, K::Npc),
+                  "kinds: article = npc; a bare capitalized name proves nothing");
+            check(k("[Combat]  A crystal snake strikes through Yourname 396 pts", None) == (K::Npc, K::Unknown),
+                  "kinds: leading article -> npc");
+            check(k("[Combat]  You have healed Yourname for 3465 points of damage.", None) == (K::Player, K::Unknown),
                   "kinds: You is the player");
             check(k("Axkva Min hits Yourname 500 pts", Some(0xf30f0f)).1 == K::Player
                       && k("Yourname hits Axkva Min 500 pts", Some(0x50f111)).0 == K::Player
@@ -171,6 +178,27 @@ mod selftest {
             check(ent("Elder mamien").contains("\"kind\":\"npc\"") && ent("Yourname").contains("\"kind\":\"player\"")
                       && ent("Giant baz nitch").contains("\"kind\":\"npc\""),
                   "snapshot: entities carry a player/npc kind");
+            // Title-case humanoid NPC with a named weapon: your green/red lines make it an NPC
+            let mut m4 = Meter::new(8.0, None);
+            let feed = |m: &mut Meter, line: &str, color: u32| {
+                if let Parsed::Event(e) = swglogs::parse::parse_line_colored(line, 1.0, Some(color)) {
+                    m.feed(e);
+                }
+            };
+            feed(&mut m4, "Tusken Relic Worshiper attacks Yourname using Gaderiffi Baton and crits for 570 points (570 kinetic).", 0xf30f0f);
+            feed(&mut m4, "Yourname attacks Tusken Relic Worshiper with Armor Shredder and hits for 420 points (420 energy).", 0x50f111);
+            feed(&mut m4, "Kestra heals Yourname for 300 points of damage.", 0x1bb9c7);
+            m4.tick(2000.0);
+            let s4 = m4.snapshot_json();
+            let kind_of = |name: &str| -> String {
+                let key = format!("\"{}\":{{", name);
+                let i = s4.find(&key).unwrap_or(0);
+                let seg = &s4[i..];
+                let j = seg.find("\"kind\":\"").map(|x| x + 8).unwrap_or(0);
+                seg[j..].chars().take_while(|c| *c != '"').collect()
+            };
+            check(kind_of("Tusken Relic Worshiper") == "npc" && kind_of("Yourname") == "player" && kind_of("Kestra") == "player",
+                  "kinds: Title-case NPC -> npc via your line colors; healer -> player");
             let vb = |line: &str| match swglogs::parse::parse_line(line, 1.0) {
                 Parsed::Event(e) => (e.amount, e.outcome, e.ability),
                 _ => (u64::MAX, swglogs::event::Outcome::Normal, String::new()),

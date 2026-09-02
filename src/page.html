@@ -49,11 +49,25 @@ function $(id){return document.getElementById(id);}
 $('bView').onclick=function(){view=VIEWS[(indexOf(VIEWS,view)+1)%3];render();};
 $('bMode').onclick=function(){mode=MODES[(indexOf(MODES,mode)+1)%3];render();};
 $('bSrc').onclick=function(){src=SRCS[(indexOf(SRCS,src)+1)%3];render();};
-$('bClear').onclick=function(){var x=new XMLHttpRequest();
-  x.open('GET','/clear',true);
-  x.onreadystatechange=function(){if(x.readyState===4&&x.status===200){
-    try{data=JSON.parse(x.responseText);}catch(e){}render();}};
-  x.send();};
+$('bClear').onclick=function(){
+  // clear on the server; if the request cannot get through (page left over
+  // from before a meter restart), reload the page instead
+  get('/clear',function(ok,txt){if(ok){try{data=JSON.parse(txt);}catch(e){}safeRender();}
+    else location.reload();});};
+// One GET with every failure path covered: the in-game browser can fail a
+// request synchronously, time out, or return status 0 after the meter was
+// restarted; each of those must still call back so polling never dies.
+function get(path,cb){var x=new XMLHttpRequest(),done=false;
+  function fin(ok,txt){if(done)return;done=true;cb(ok,txt);}
+  try{
+    x.open('GET',path+(path.indexOf('?')<0?'?':'&')+'t='+new Date().getTime(),true);
+    x.timeout=2000;
+    x.onreadystatechange=function(){if(x.readyState===4){lastStatus=x.status;fin(x.status===200,x.responseText);}};
+    x.onerror=function(){fin(false,'');};
+    x.ontimeout=function(){fin(false,'');};
+    x.send();
+  }catch(e){fin(false,'');}}
+var fails=0,oks=0,lastStatus='-';
 function indexOf(a,v){for(var i=0;i<a.length;i++)if(a[i]===v)return i;return -1;}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/"/g,'&quot;');}
@@ -65,31 +79,35 @@ function mmss(d){d=Math.round(d);var m=Math.floor(d/60),s=d%60;
 function color(name){var h=0;
   for(var i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0;
   return 'hsl('+(h%360)+',45%,38%)';}
-function poll(){var x=new XMLHttpRequest();
-  x.open('GET','/data',true);
-  x.onreadystatechange=function(){if(x.readyState===4){
-    if(x.status===200){try{data=JSON.parse(x.responseText);}catch(e){}render();}
-    setTimeout(poll,250);}};
-  x.send();}
-function src(){var l=data&&data.meta&&data.meta.log;
-  return l?'<br><span style="font-size:10px">'+esc(l)+'</span>':'';}
+function safeRender(){try{render();}catch(e){$('meta').textContent='page error: '+e;}}
+function poll(){
+  get('/data',function(ok,txt){
+    if(ok){fails=0;oks++;try{data=JSON.parse(txt);}catch(e){}safeRender();}
+    else{fails++;if(fails>=4)$('meta').textContent='reconnecting\u2026';}
+    // always reschedule; back off a little while the meter is unreachable
+    setTimeout(poll,fails?1000:250);});}
+function clock(){var d=new Date(),z=function(n){return (n<10?'0':'')+n;};
+  return z(d.getHours())+':'+z(d.getMinutes())+':'+z(d.getSeconds());}
+function stats(){return ' · '+clock()+' · polls '+oks+' ok / '+fails+' fail (last '+lastStatus+')';}
+function statusLine(){var l=data&&data.meta&&data.meta.log;
+  return '<br><span style="font-size:10px">'+(l?esc(l):'')+esc(stats())+'</span>';}
 function render(){
   $('bView').textContent=VIEW_LBL[view];
   $('bMode').textContent=MODE_LBL[mode];
   $('bSrc').textContent=SRC_LBL[src];
   var rowsEl=$('rows');
-  if(!data){return;}
+  if(!data){$('meta').textContent=stats();return;}
   var nt=$('notice'),msg=data.meta&&data.meta.notice;
   nt.style.display=msg?'block':'none';if(msg)nt.textContent=msg;
   var enc=data[view], idle='';
   if(!enc&&view==='current'&&data.last){enc=data.last;idle=' idle';}
-  if(!enc){rowsEl.innerHTML='<div id="empty">no data yet'+src()+'</div>';
+  if(!enc){rowsEl.innerHTML='<div id="empty">no data yet'+statusLine()+'</div>';
     $('meta').textContent='';return;}
   var dur=enc.dur||1;
   var fresh='';
   if(data.meta&&data.meta.stale!=null&&data.meta.stale>10)
     fresh=' ⚠'+Math.round(data.meta.stale)+'s';
-  $('meta').textContent=mmss(dur)+idle+fresh;
+  $('meta').textContent=mmss(dur)+idle+fresh+' · '+clock();
   var arr=[],n,e,v;
   for(n in enc.entities){e=enc.entities[n];
     var k=e.kind||'unknown';
@@ -99,7 +117,7 @@ function render(){
     if(v>0)arr.push([n,v,e]);}
   arr.sort(function(a,b){return b[1]-a[1];});
   if(!arr.length){rowsEl.innerHTML='<div id="empty">'+MODE_LBL[mode]
-    +': nothing yet'+src()+'</div>';return;}
+    +': nothing yet'+statusLine()+'</div>';return;}
   var max=arr[0][1],total=0,i;
   for(i=0;i<arr.length;i++)total+=arr[i][1];
   var me=(data.meta&&data.meta.player)||'You';

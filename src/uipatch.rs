@@ -6,9 +6,13 @@
 //! browser page (`ui/ui_pda.inc`, page `WebBrowser`) does not, so a meter
 //! opened with `/browser` vanishes as soon as you start fighting.
 //!
-//! On startup we look for a loose `ui/ui_pda.inc` in the game directory and,
-//! if its WebBrowser CodeData lacks the attribute, insert it (keeping a
-//! backup). The client reads UI files at launch, so the change applies from
+//! Escape closes it too: the UI system presses whichever button a window
+//! flags as its cancel button, and the browser's title-bar X carries that
+//! flag. Clearing the flag keeps the X clickable but takes it off Escape, so
+//! spamming Escape in a fight no longer kills the meter.
+//!
+//! On startup we look for a loose `ui/ui_pda.inc` in the game directory and
+//! apply both changes if they are missing (keeping a backup). The client reads UI files at launch, so the change applies from
 //! the next game start. Without a loose file (stock install: the page lives
 //! inside a TRE archive) we only print how to get one.
 
@@ -26,10 +30,39 @@ pub enum Outcome {
 
 const ATTR: &str = "StickyVisible='true'";
 
+/// Apply every browser-window fix that is missing. None = nothing to change
+/// (or no WebBrowser page found).
+pub fn patch_text(src: &str) -> Option<String> {
+    let sticky = patch_sticky(src);
+    let after_sticky = sticky.as_deref().unwrap_or(src);
+    match patch_escape(after_sticky) {
+        Some(s) => Some(s),
+        None => sticky,
+    }
+}
+
+/// Take the WebBrowser window's close button off the Escape key: inside the
+/// page, the `<Button ... Name='close' ...>` element gets
+/// `IsCancelButton='false'`. None when already so (or absent, which the UI
+/// treats as false) or when the page / button is not found.
+fn patch_escape(src: &str) -> Option<String> {
+    let page = src.find("Name='WebBrowser'")?;
+    let close_name = src[page..].find("Name='close'")? + page;
+    let open = src[..close_name].rfind("<Button")?;
+    let end = src[close_name..].find('>')? + close_name;
+    let elem = &src[open..end];
+    let flag = elem.find("IsCancelButton='true'")? + open;
+    let mut out = String::with_capacity(src.len() + 1);
+    out.push_str(&src[..flag]);
+    out.push_str("IsCancelButton='false'");
+    out.push_str(&src[flag + "IsCancelButton='true'".len()..]);
+    Some(out)
+}
+
 /// Insert `StickyVisible='true'` into the WebBrowser page's CodeData.
 /// Returns None when nothing needs to change (already set, or the page /
 /// CodeData block could not be found).
-pub fn patch_text(src: &str) -> Option<String> {
+fn patch_sticky(src: &str) -> Option<String> {
     let page = src.find("Name='WebBrowser'")?;
     // The CodeData block is the <Data ... /> after the page start that maps
     // the browser image; `browserimage=` is unique to it.
@@ -110,4 +143,14 @@ pub fn selfcheck(check: &mut dyn FnMut(bool, &str)) {
         "uipatch: flips an explicit false",
     );
     check(patch_text("<Data browserimage='x' />").is_none(), "uipatch: no WebBrowser page -> untouched");
+    let with_close = "\t\t<Page\r\n\t\t\tName='WebBrowser'\r\n\t\t>\r\n\t\t\t<Data\r\n\t\t\t\tStickyVisible='true'\r\n\t\t\t\tbrowserimage='x'\r\n\t\t\t/>\r\n\t\t\t\t\t<Button\r\n\t\t\t\t\t\tIsCancelButton='true'\r\n\t\t\t\t\t\tName='close'\r\n\t\t\t\t\t></Button>\r\n\t\t</Page>\r\n";
+    let out2 = patch_text(with_close).unwrap_or_default();
+    check(
+        out2.contains("IsCancelButton='false'\r\n\t\t\t\t\t\tName='close'") && !out2.contains("IsCancelButton='true'"),
+        "uipatch: close button taken off the Escape key",
+    );
+    check(patch_text(&out2).is_none(), "uipatch: idempotent once both fixes are in");
+    // a cancel button elsewhere on the page (not the close X) is left alone
+    let other = "\t\t<Page\r\n\t\t\tName='WebBrowser'\r\n\t\t>\r\n\t\t\t<Data StickyVisible='true' browserimage='x' />\r\n\t\t\t<Button IsCancelButton='true' Name='buttonStop'></Button>\r\n\t\t\t<Button Name='close'></Button>\r\n\t\t</Page>\r\n";
+    check(patch_text(other).is_none(), "uipatch: only the close button's cancel flag is touched");
 }

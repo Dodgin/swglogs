@@ -150,9 +150,11 @@ pub fn parse_line(raw_line: &str, ts: f64) -> Parsed {
     parse_line_colored(raw_line, ts, None)
 }
 
-/// Player or NPC, from how `name` appears in `body`: NPC names carry an
-/// article ("a kwi", "an elder mamien", "the ...") or start lowercase;
-/// player names are bare and capitalized. "You" is the player.
+/// What the name's form alone says: an article ("a kwi", "an elder mamien",
+/// "the ...") or a lowercase start means NPC; "You" is the player. A bare
+/// capitalized name is NOT evidence either way — humanoid NPCs are Title Case
+/// too ("Tusken Relic Worshiper attacks Shootin using Gaderiffi Baton") — so
+/// it stays Unknown and the line's color decides (see `parse_line_colored`).
 fn kind_in(body: &str, name: &str) -> EntityKind {
     if name == "You" {
         return EntityKind::Player;
@@ -175,7 +177,7 @@ fn kind_in(body: &str, name: &str) -> EntityKind {
             return EntityKind::Npc;
         }
     }
-    EntityKind::Player
+    EntityKind::Unknown
 }
 
 /// `parse_line` with the line's color, when the source has one; the color

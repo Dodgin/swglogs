@@ -112,7 +112,8 @@ pub fn print_help() {
 /// just the window, no stray console). Such a process gets no console of its
 /// own — `swglogs --headless` or `--selftest` typed into a terminal would
 /// print nothing. If stdout is not already connected (a pipe or a redirect
-/// is left alone), attach to the terminal that launched us.
+/// is left alone), attach to the terminal that launched us. Called only for
+/// invocations with flags; a bare window-mode launch stays detached.
 pub fn attach_parent_console() {
     #[cfg(windows)]
     unsafe {
@@ -226,7 +227,7 @@ fn apply_ui_patch(cfg: &Config) -> Option<Notice> {
         Ok(uipatch::Outcome::Patched(backup)) => {
             println!(
                 "[swglogs] patched {}\\ui\\ui_pda.inc so the /browser meter stays open in action mode \
-                 (StickyVisible='true'; backup {}).",
+                 and ignores the Escape key (backup {}).",
                 game_dir.display(),
                 backup
             );

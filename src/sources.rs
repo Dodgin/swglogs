@@ -827,8 +827,10 @@ pub mod memory {
             // (Re)scan the client for combat text: at start, whenever nothing
             // is being followed, every 10 s while the followed region has been
             // quiet for 20 s (it may have been reallocated), else every 2 min.
+            // A freshly started client has no combat text at all until the
+            // first fight; rescan every 5 s in that state.
             let idle = primary.map_or(true, |p| now - cands[p].last_change > 20.0);
-            if cands.is_empty() || (idle && now - last_scan > 10.0) || now - last_scan > 120.0 {
+            if (cands.is_empty() && now - last_scan > 5.0) || (idle && now - last_scan > 10.0) || now - last_scan > 120.0 {
                 last_scan = now;
                 let regions = match pinned {
                     Some(r) => vec![(r, r + 0x10000)],
@@ -848,10 +850,16 @@ pub mod memory {
                 cands = next;
                 primary = prim_region.and_then(|(st, en)| cands.iter().position(|c| c.start == st && c.end == en));
                 if cands.is_empty() {
-                    sink.set_log_label(&format!("(memory: pid {} — no combat text in the client yet; waiting)", pid));
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
+                    sink.set_log_label(&format!(
+                        "(memory: pid {} — the client has no combat text yet (fresh login / no fight since it started);                          hit something and it appears within a few seconds)",
+                        pid
+                    ));
                 }
+            }
+
+            if cands.is_empty() {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
             }
 
             // Read every candidate once; note whose newest line moved.
