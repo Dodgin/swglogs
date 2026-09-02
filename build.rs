@@ -35,6 +35,10 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 fn main() {
     println!("cargo:rerun-if-changed={}", ICO);
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=SWGLOGS_NO_UAC");
+    // Dev switch: SWGLOGS_NO_UAC=1 builds without the requireAdministrator
+    // manifest so `--selftest` can run from an un-elevated shell.
+    let uac = env::var("SWGLOGS_NO_UAC").is_err();
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -49,14 +53,17 @@ fn main() {
     let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if msvc {
         let res = out.join("swglogs.res");
-        fs::write(&res, build_res(&ico)).unwrap();
+        fs::write(&res, build_res(&ico, uac)).unwrap();
         println!("cargo:rustc-link-arg-bins={}", res.display());
     } else {
         // GNU: windres compiles an .rc into a COFF object we can link.
         let unix = |p: &Path| p.display().to_string().replace('\\', "/");
-        let manifest = out.join("swglogs.manifest");
-        fs::write(&manifest, MANIFEST).unwrap();
-        let mut rc = format!("1 24 \"{}\"\n", unix(&manifest));
+        let mut rc = String::new();
+        if uac {
+            let manifest = out.join("swglogs.manifest");
+            fs::write(&manifest, MANIFEST).unwrap();
+            rc.push_str(&format!("1 24 \"{}\"\n", unix(&manifest)));
+        }
         if !ico.is_empty() {
             rc.push_str(&format!("1 ICON \"{}\"\n", unix(&fs::canonicalize(ICO).unwrap())));
         }
@@ -76,11 +83,13 @@ fn main() {
 /// Emit a .res with the manifest (RT_MANIFEST id 1) and, if an .ico was
 /// given, one RT_ICON per image plus the RT_GROUP_ICON directory (id 1)
 /// that ties them together.
-fn build_res(ico: &[u8]) -> Vec<u8> {
+fn build_res(ico: &[u8], uac: bool) -> Vec<u8> {
     let mut res = Vec::new();
     // leading empty record = file signature
     res.extend_from_slice(&record(0xFFFF, 0, &[]));
-    res.extend_from_slice(&record(RT_MANIFEST, 1, MANIFEST.as_bytes()));
+    if uac {
+        res.extend_from_slice(&record(RT_MANIFEST, 1, MANIFEST.as_bytes()));
+    }
     if ico.is_empty() {
         return res;
     }

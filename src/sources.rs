@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::event::{Event, Kind, Outcome};
+use crate::event::{EntityKind, Event, Kind, Outcome};
 use crate::logwriter::LogWriter;
 use crate::meter::{now_secs, Meter};
-use crate::parse::{parse_line, Parsed};
+use crate::parse::{parse_line_colored, Parsed};
 
 /// Fan-out target: parse+meter+log. Cloneable handle over shared state.
 #[derive(Clone)]
@@ -26,7 +26,13 @@ pub struct Sink {
 impl Sink {
     /// Ingest one raw text line (chatlog or IPC combat text).
     pub fn line(&self, raw: &str, ts: f64) {
-        let parsed = parse_line(raw, ts);
+        self.line_colored(raw, None, ts);
+    }
+
+    /// Ingest one raw text line together with its `\#RRGGBB` color (memory
+    /// scrollback), which pins which end of the line is the local player.
+    pub fn line_colored(&self, raw: &str, color: Option<u32>, ts: f64) {
+        let parsed = parse_line_colored(raw, ts, color);
         {
             let mut m = self.meter.lock().unwrap();
             m.lines += 1;
@@ -182,6 +188,9 @@ pub fn demo(sink: Sink) {
                     outcome: if crit { Outcome::Critical } else { Outcome::Normal },
                     ability: abils[(rng() as usize) % abils.len()].to_string(),
                     raw: String::new(),
+                    src_kind: EntityKind::Player,
+                    tgt_kind: EntityKind::Npc,
+                    color: None,
                 });
             }
         }
@@ -195,6 +204,9 @@ pub fn demo(sink: Sink) {
                 outcome: Outcome::Normal,
                 ability: "Bacta Burst".to_string(),
                 raw: String::new(),
+                src_kind: EntityKind::Player,
+                tgt_kind: EntityKind::Player,
+                color: None,
             });
         }
         sink.event(Event {
@@ -206,6 +218,9 @@ pub fn demo(sink: Sink) {
             outcome: Outcome::Normal,
             ability: "Bite".to_string(),
             raw: String::new(),
+            src_kind: EntityKind::Npc,
+            tgt_kind: EntityKind::Player,
+            color: None,
         });
         // Occasionally go quiet longer than the encounter gap, so the "Now"
         // encounter closes and rolls into "Last" — mimics a fight ending.
@@ -467,7 +482,7 @@ pub mod memory {
     /// Cheap sanity filter shared by both acceptors: plausible length and
     /// almost entirely clean printable text (rejects heap junk).
     fn looks_clean(l: &str) -> bool {
-        if !(8 < l.len() && l.len() < 200) {
+        if !(8 < l.len() && l.len() < 400) {
             return false;
         }
         let clean = l.chars().filter(|c| c.is_ascii_alphanumeric() || " '()-.,:/".contains(*c)).count();
@@ -481,11 +496,11 @@ pub mod memory {
         if !looks_clean(l) {
             return false;
         }
-        let has_verb = [" hits", " crits", " glances", " strikes", " heals", " healed ", "has caused", "has taken", "have taken"]
+        let has_verb = [" hits", " crits", " glances", " strikes", " heals", " healed ", "has caused", "has taken", "have taken", " attacks "]
             .iter().any(|v| l.contains(v));
         let ends = l.trim_end().ends_with("pts")
             && l.rsplit(' ').nth(1).map_or(false, |w| w.chars().all(|c| c.is_ascii_digit()));
-        has_verb && (ends || l.contains("points of"))
+        has_verb && (ends || l.contains("points of") || l.contains(" points ("))
     }
 
     /// Wide acceptor used while TAILING: everything `parse.rs` understands —
@@ -502,6 +517,9 @@ pub mod memory {
         if l.contains(" performs ") || l.contains(" misses") {
             return true;
         }
+        if l.contains(" attacks ") && (l.contains(" for ") || l.contains("nd misses")) {
+            return true;
+        }
         let low = l.to_ascii_lowercase();
         ["incapacitated", "killed", "defeated", "destroyed", "slain"].iter().any(|k| low.contains(k))
             && ["has been", "have been", " was ", " is "].iter().any(|k| low.contains(k))
@@ -514,6 +532,32 @@ pub mod memory {
     /// a later " pts"); DoT/heal lines end at "damage"; performs/deaths at the
     /// first period; misses at the closing paren.
     fn trim_combat(l: &str) -> &str {
+        // verbose: keep through the damage breakdown ")" (or the miss's "."),
+        // dropping "Armor absorbed ..." and any stale tail.
+        if let Some(a) = l.find(" attacks ") {
+            // amount = "for <digits> points", optionally followed by the
+            // "(<breakdown>)" when Show Damage Detail is on
+            let mut from = a;
+            while let Some(rel) = l[from..].find(" for ") {
+                let p = from + rel + " for ".len();
+                let digits = l[p..].chars().take_while(|c| c.is_ascii_digit() || *c == ',').count();
+                if digits > 0 && l[p + digits..].starts_with(" points") {
+                    let mut end = p + digits + " points".len();
+                    if l[end..].starts_with(" (") {
+                        if let Some(c) = l[end..].find(')') {
+                            end += c + 1;
+                        }
+                    }
+                    return &l[..end];
+                }
+                from = p;
+            }
+            if let Some(m) = l.find("nd misses") {
+                if let Some(d) = l[m..].find('.') {
+                    return &l[..m + d + 1];
+                }
+            }
+        }
         let mut from = 0;
         while let Some(rel) = l[from..].find(" pts") {
             let p = from + rel;
@@ -542,17 +586,28 @@ pub mod memory {
         l
     }
 
+    /// One accepted scrollback line: where it sits in the window, its clean
+    /// text, and the `\#RRGGBB` color it was rendered in (None if the line
+    /// carried no color code).
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Line {
+        pub off: usize,
+        pub text: String,
+        pub color: Option<u32>,
+    }
+
     /// Decode a UTF-16LE window into NUL-separated RUNS of `\n`-separated
-    /// lines, SWG color codes stripped; each line is (byte_offset, clean_text)
-    /// and only accepted combat lines are kept. The live scrollback is one
-    /// contiguous string: lines joined by `\n`, the newest line ending right
-    /// at a NUL, and stale fragments of older (longer) text beyond that NUL.
-    /// A line cut off by the END of the window is discarded — it is not a
-    /// real line.
-    fn extract_runs(win: &[u8], accept: fn(&str) -> bool) -> Vec<Vec<(usize, String)>> {
-        let mut runs: Vec<Vec<(usize, String)>> = Vec::new();
-        let mut run: Vec<(usize, String)> = Vec::new();
+    /// lines, SWG color codes stripped (the line's leading color is kept as
+    /// `Line::color`); only accepted combat lines are kept. The live
+    /// scrollback is one contiguous string: lines joined by `\n`, the newest
+    /// line ending right at a NUL, and stale fragments of older (longer) text
+    /// beyond that NUL. A line cut off by the END of the window is discarded —
+    /// it is not a real line.
+    fn extract_runs(win: &[u8], accept: fn(&str) -> bool) -> Vec<Vec<Line>> {
+        let mut runs: Vec<Vec<Line>> = Vec::new();
+        let mut run: Vec<Line> = Vec::new();
         let mut cur = String::new();
+        let mut color: Option<u32> = None;
         let mut start = 0usize;
         let mut begun = false;
         let mut k = 0usize;
@@ -562,12 +617,13 @@ pub mod memory {
                 start = k;
                 begun = true;
             }
-            if c == 0x0A || c == 0x0D || c == 0 || cur.len() > 200 {
+            if c == 0x0A || c == 0x0D || c == 0 || cur.len() > 400 {
                 let t = trim_combat(cur.trim());
                 if accept(t) {
-                    run.push((start, t.to_string()));
+                    run.push(Line { off: start, text: t.to_string(), color });
                 }
                 cur.clear();
+                color = None;
                 begun = false;
                 if c == 0 && !run.is_empty() {
                     runs.push(std::mem::take(&mut run));
@@ -580,10 +636,17 @@ pub mod memory {
                 if n1 == 0x23 {
                     let mut j = k + 4;
                     let mut hexn = 0;
+                    let mut val = 0u32;
                     while j + 1 < win.len() && hexn < 6 {
                         let h = (win[j] as u16) | ((win[j + 1] as u16) << 8);
                         if h == 0x2E { j += 2; break; }
-                        if (h as u8).is_ascii_hexdigit() { hexn += 1; j += 2; } else { break; }
+                        match (h as u8 as char).to_digit(16) {
+                            Some(d) if h < 0x80 => { val = val * 16 + d; hexn += 1; j += 2; }
+                            _ => break,
+                        }
+                    }
+                    if hexn == 6 && cur.trim().is_empty() {
+                        color = Some(val); // the color the line starts in
                     }
                     k = j;
                     continue;
@@ -601,15 +664,25 @@ pub mod memory {
     }
 
     /// All accepted lines in the window, in offset order (used to locate).
-    fn extract(win: &[u8], accept: fn(&str) -> bool) -> Vec<(usize, String)> {
+    fn extract(win: &[u8], accept: fn(&str) -> bool) -> Vec<Line> {
         extract_runs(win, accept).into_iter().flatten().collect()
     }
 
-    /// The live scrollback: the run with the most accepted lines. Stale
-    /// fragments past its NUL and unrelated heap text are left out, so the
-    /// run's last line really is the newest line in the buffer.
-    fn live_run(win: &[u8]) -> Vec<(usize, String)> {
-        extract_runs(win, combat_like).into_iter().max_by_key(|r| r.len()).unwrap_or_default()
+    /// The live scrollback in a window read at `base`: the run that covers the
+    /// candidate region `lo..hi` — a bigger, frozen copy elsewhere in the
+    /// window must not win just by size. Among covering runs the largest; if
+    /// none covers it, the largest overall. Stale fragments past the run's NUL
+    /// and unrelated heap text are left out, so the run's last line really is
+    /// the newest line in the buffer.
+    fn live_run(win: &[u8], base: usize, lo: usize, hi: usize) -> Vec<Line> {
+        let runs = extract_runs(win, combat_like);
+        let covers = |r: &Vec<Line>| r.iter().any(|l| (lo..hi).contains(&(base + l.off)));
+        runs.iter()
+            .filter(|r| covers(r))
+            .max_by_key(|r| r.len())
+            .or_else(|| runs.iter().max_by_key(|r| r.len()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Full grammar-scan of the 32-bit space; per 64 KiB bin record the combat
@@ -622,10 +695,10 @@ pub mod memory {
         while addr < 0x7FFF_0000 {
             let got = p.read(addr, &mut buf);
             if got > 0 {
-                for (off, line) in extract(&buf[..got], grammar_ok) {
-                    let e = bins.entry((addr + off) >> 16).or_insert((0, String::new()));
+                for l in extract(&buf[..got], grammar_ok) {
+                    let e = bins.entry((addr + l.off) >> 16).or_insert((0, String::new()));
                     e.0 += 1;
-                    e.1 = line;
+                    e.1 = l.text;
                 }
                 addr += got.max(1);
             } else {
@@ -635,42 +708,35 @@ pub mod memory {
         bins
     }
 
-    /// Locate the LIVE combat scrollback: the bin whose combat text actually
-    /// CHANGES over a short interval, not merely the densest (a frozen backlog
-    /// from a prior fight can out-count the live buffer). Returns None until a
-    /// change is seen (i.e. until something is actually happening in combat),
-    /// so it never latches a stale block.
-    fn locate(p: &Proc) -> Option<usize> {
-        let first = scan_bins(p);
-        // candidate bins: enough combat lines to be a real scrollback, not noise
-        let cands: Vec<usize> = first
-            .iter()
-            .filter(|(_, (c, _))| *c >= 3)
-            .map(|(&b, _)| b)
-            .collect();
-        if cands.is_empty() {
-            return None;
-        }
-        // Re-read each candidate bin with the SAME 64 KiB window scan_bins used,
-        // after a short delay. The live buffer is the one whose most-recent
-        // combat line has ADVANCED (count is unreliable across window sizes;
-        // the last-line identity is the honest signal).
-        std::thread::sleep(Duration::from_millis(1200));
-        let mut win = vec![0u8; 0x10000]; // one 64 KiB bin, matching scan_bins
-        let mut best: Option<(usize, u32)> = None; // (bin, score) among changed
-        for &b in &cands {
-            let got = p.read(b << 16, &mut win);
-            let lines = if got > 0 { extract(&win[..got], grammar_ok) } else { Vec::new() };
-            let last2 = lines.last().map(|(_, l)| l.clone()).unwrap_or_default();
-            let (c1, last1) = first.get(&b).cloned().unwrap_or((0, String::new()));
-            if !last2.is_empty() && last2 != last1 {
-                let score = lines.len() as u32 + c1;
-                if best.map_or(true, |(_, bs)| score > bs) {
-                    best = Some((b, score));
-                }
+    /// Candidate scrollback regions from a scan: maximal spans of consecutive
+    /// 64 KiB bins holding at least 3 combat lines, as (start, end) addresses.
+    fn candidates(bins: &std::collections::HashMap<usize, (u32, String)>) -> Vec<(usize, usize)> {
+        let mut starts: Vec<usize> = bins.iter().filter(|(_, (c, _))| *c >= 3).map(|(&b, _)| b << 16).collect();
+        starts.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for st in starts {
+            match out.last_mut() {
+                Some(last) if last.1 == st => last.1 = st + 0x10000,
+                _ => out.push((st, st + 0x10000)),
             }
         }
-        best.map(|(b, _)| b << 16)
+        out
+    }
+
+    /// One candidate region and what we know about it. The reader follows
+    /// ALL of them every tick and emits from the one that is actually
+    /// advancing, so a frozen copy of the scrollback can never trap it.
+    struct Cand {
+        start: usize,
+        end: usize,
+        anchor: Option<Anchor>,
+        prev_tail: Option<String>,
+        /// when its newest line last changed (0 = never seen changing)
+        last_change: f64,
+        changed_now: bool,
+        empty_ticks: u32,
+        nlines: usize,
+        emitted_any: bool,
     }
 
     /// Where we are in the buffer: the last line we emitted, identified by the
@@ -679,6 +745,7 @@ pub mod memory {
     /// is at its line cap every append trims the oldest line and shifts the
     /// whole text. Text alone breaks on repeated identical hits. Context
     /// resolves both.
+    #[derive(Clone)]
     struct Anchor {
         off: usize,
         /// Up to CTX lines ending with the anchor line itself.
@@ -687,27 +754,27 @@ pub mod memory {
     const CTX: usize = 6;
 
     impl Anchor {
-        fn seed(lines: &[(usize, String)], i: usize) -> Anchor {
+        fn seed(lines: &[Line], i: usize) -> Anchor {
             let lo = (i + 1).saturating_sub(CTX);
-            Anchor { off: lines[i].0, ctx: lines[lo..=i].iter().map(|(_, l)| l.clone()).collect() }
+            Anchor { off: lines[i].off, ctx: lines[lo..=i].iter().map(|l| l.text.clone()).collect() }
         }
 
         /// Index of the anchor line in `lines`, or None if it is gone.
-        fn find(&self, lines: &[(usize, String)]) -> Option<usize> {
+        fn find(&self, lines: &[Line]) -> Option<usize> {
             let last = self.ctx.last()?;
             let mut best: Option<(usize, usize, bool)> = None; // (idx, score, off_match)
-            for (i, (off, l)) in lines.iter().enumerate() {
-                if l != last {
+            for (i, l) in lines.iter().enumerate() {
+                if l.text != *last {
                     continue;
                 }
                 let mut score = 1;
                 while score < self.ctx.len()
                     && i >= score
-                    && lines[i - score].1 == self.ctx[self.ctx.len() - 1 - score]
+                    && lines[i - score].text == self.ctx[self.ctx.len() - 1 - score]
                 {
                     score += 1;
                 }
-                let om = *off == self.off;
+                let om = l.off == self.off;
                 let better = match best {
                     None => true,
                     Some((_, bs, bom)) => score > bs || (score == bs && (om && !bom || om == bom)),
@@ -736,78 +803,143 @@ pub mod memory {
             return;
         }
         let proc = Proc(h);
-        sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} — locating buffer)", pid));
+        sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} — scanning for combat text)", pid));
 
-        let mut region: Option<usize> = None;
-        let mut anchor: Option<Anchor> = None;
-        // Text of the newest buffer line as of the previous tick (see hold-back).
-        let mut prev_tail: Option<String> = None;
-        let mut emitted_any = false;
-        let mut empty_ticks = 0u32;
+        const SLACK: usize = 0x8000; // read this much before/after a region
+        let mut cands: Vec<Cand> = Vec::new();
+        let mut primary: Option<usize> = None;
+        let mut last_scan = 0.0f64;
         let mut resyncs = 0u32;
-        let mut last_new = now_secs();
-        let mut last_probe = now_secs();
         let mut last_label = String::new();
         let mut dump_n = 0u32;
-        let mut win = vec![0u8; 0x60000]; // 384 KiB read per tick
-        let label = |r: usize, resyncs: u32, seen: usize| {
-            format!(
-                "(memory: pid {} buffer 0x{:08X}, {} lines in buffer{})",
-                pid, r, seen,
-                if resyncs == 0 { String::new() } else { format!(", {} resyncs", resyncs) }
-            )
-        };
+        let mut win = vec![0u8; 0x80000]; // up to 512 KiB per candidate read
+        let mut win2 = vec![0u8; 0x80000]; // second read of the primary: torn-read check
+        let pinned = std::env::var("SWGLOGS_MEMREGION").ok()
+            .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok());
 
         loop {
             {
                 let mut m = sink.meter.lock().unwrap();
                 m.tick(now_secs());
             }
-            if region.is_none() {
-                region = std::env::var("SWGLOGS_MEMREGION").ok()
-                    .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-                    .or_else(|| locate(&proc));
-                if let Some(r) = region {
-                    sink.set_log_label(&label(r, resyncs, 0));
-                    anchor = None;
-                    prev_tail = None;
-                    emitted_any = false;
-                    last_new = now_secs();
-                } else {
-                    sink.set_log_label(&format!(
-                        "(memory: pid {} — waiting for combat to locate live buffer)",
-                        pid
-                    ));
-                    std::thread::sleep(Duration::from_secs(1));
+            let now = now_secs();
+
+            // (Re)scan the client for combat text: at start, whenever nothing
+            // is being followed, every 10 s while the followed region has been
+            // quiet for 20 s (it may have been reallocated), else every 2 min.
+            let idle = primary.map_or(true, |p| now - cands[p].last_change > 20.0);
+            if cands.is_empty() || (idle && now - last_scan > 10.0) || now - last_scan > 120.0 {
+                last_scan = now;
+                let regions = match pinned {
+                    Some(r) => vec![(r, r + 0x10000)],
+                    None => candidates(&scan_bins(&proc)),
+                };
+                let prim_region = primary.map(|p| (cands[p].start, cands[p].end));
+                let mut next: Vec<Cand> = Vec::with_capacity(regions.len());
+                for (st, en) in regions {
+                    match cands.iter().position(|c| c.start == st && c.end == en) {
+                        Some(i) => next.push(cands.swap_remove(i)),
+                        None => next.push(Cand {
+                            start: st, end: en, anchor: None, prev_tail: None, last_change: 0.0,
+                            changed_now: false, empty_ticks: 0, nlines: 0, emitted_any: false,
+                        }),
+                    }
+                }
+                cands = next;
+                primary = prim_region.and_then(|(st, en)| cands.iter().position(|c| c.start == st && c.end == en));
+                if cands.is_empty() {
+                    sink.set_log_label(&format!("(memory: pid {} — no combat text in the client yet; waiting)", pid));
+                    std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
             }
 
-            // Long idle: the buffer may have been reallocated elsewhere, leaving
-            // us watching a frozen copy that still parses fine. Probe for a
-            // live buffer now and then; switch only if a different one is
-            // actually advancing.
-            let now = now_secs();
-            if now - last_new > 20.0 && now - last_probe > 10.0 {
-                last_probe = now;
-                if let Some(r) = locate(&proc) {
-                    if Some(r) != region {
-                        region = Some(r);
-                        anchor = None;
-                        prev_tail = None;
-                        emitted_any = false;
-                        resyncs += 1;
-                    }
+            // Read every candidate once; note whose newest line moved.
+            let mut lines_of: Vec<Vec<Line>> = Vec::with_capacity(cands.len());
+            for c in cands.iter_mut() {
+                let base = c.start.saturating_sub(SLACK);
+                let len = (c.end + SLACK - base).min(win.len());
+                let got = proc.read(base, &mut win[..len]);
+                let lines = if got > 0 { live_run(&win[..got], base, c.start, c.end) } else { Vec::new() };
+                c.nlines = lines.len();
+                let tail = lines.last().map(|l| l.text.clone());
+                c.changed_now = tail.is_some() && tail != c.prev_tail;
+                if c.changed_now && c.prev_tail.is_some() {
+                    c.last_change = now;
                 }
+                if tail.is_some() {
+                    c.prev_tail = tail;
+                }
+                lines_of.push(lines);
             }
 
-            let base = region.unwrap().saturating_sub(0x8000);
-            let got = proc.read(base, &mut win);
+            // Follow the region that advanced most recently. Switch away from
+            // the current one only once it has been quiet for 5 s while
+            // another one moved (so two mirrors of the same text never
+            // double-emit: only one region is ever read for events).
+            let best = cands.iter().enumerate()
+                .filter(|(_, c)| c.last_change > 0.0)
+                .max_by(|a, b| a.1.last_change.partial_cmp(&b.1.last_change).unwrap())
+                .map(|(i, _)| i);
+            match (primary, best) {
+                (None, Some(b)) => primary = Some(b),
+                (Some(p), Some(b)) if b != p && now - cands[p].last_change > 5.0 && cands[b].last_change > cands[p].last_change => {
+                    // Carry the position across: the mirrors hold the same
+                    // text, so the old anchor (text + context) is found in
+                    // the new region and nothing in between is lost. If it is
+                    // not found there, the anchor logic below reseeds.
+                    cands[b].anchor = cands[p].anchor.clone();
+                    cands[b].emitted_any = cands[p].emitted_any;
+                    primary = Some(b);
+                    resyncs += 1;
+                }
+                _ => {}
+            }
+            let p = match primary {
+                Some(p) => p,
+                None => {
+                    let mut lab = format!("(memory: pid {} — {} candidate region(s); waiting for combat to see which one is live)", pid, cands.len());
+                    for c in &cands {
+                        lab.push_str(&format!("
+   0x{:08X}-0x{:08X} {:4} lines{}", c.start, c.end, c.nlines,
+                            if c.last_change > 0.0 { format!(" moved {:.0}s ago", now - c.last_change) } else { String::new() }));
+                    }
+                    if lab != last_label {
+                        sink.set_log_label(&lab);
+                        last_label = lab;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            };
+
+            let lines = std::mem::take(&mut lines_of[p]);
+            if lines.is_empty() {
+                cands[p].empty_ticks += 1;
+                if cands[p].empty_ticks > 24 {
+                    // gone (freed/reallocated): forget it and rescan
+                    cands.remove(p);
+                    primary = None;
+                    last_scan = 0.0;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            cands[p].empty_ticks = 0;
+
+            // Torn reads: the game shifts the whole scrollback text while we
+            // copy it, and a copy that straddles that shift splices two
+            // versions of a line together ("Shoon attacks", "fire dage").
+            // Such a splice is transient, so a line is trusted only when a
+            // second, immediate read of the window shows the same text.
+            let base = cands[p].start.saturating_sub(SLACK);
+            let len = (cands[p].end + SLACK - base).min(win2.len());
+            let got2 = proc.read(base, &mut win2[..len]);
             // Diagnostic: SWGLOGS_MEMDUMP=<dir> writes the raw window for the
-            // first 12 ticks after the buffer is found, for offline analysis.
+            // first 12 ticks with a followed region, for offline analysis.
             if let Ok(dir) = std::env::var("SWGLOGS_MEMDUMP") {
                 if dump_n < 12 {
-                    let _ = fs::write(format!("{}/win_{:02}_{:08X}_{}.bin", dir, dump_n, base, got), &win[..got]);
+                    let _ = fs::write(format!("{}/win_{:02}_{:08X}_{}.bin", dir, dump_n, base, got2), &win2[..got2]);
                     dump_n += 1;
                     if dump_n == 12 {
                         eprintln!("[swglogs] memdump complete");
@@ -815,63 +947,64 @@ pub mod memory {
                     }
                 }
             }
-            let lines = if got > 0 { live_run(&win[..got]) } else { Vec::new() };
-
-            if lines.is_empty() {
-                empty_ticks += 1;
-                if empty_ticks > 24 {
-                    region = None; // buffer moved/reallocated — re-locate
-                    empty_ticks = 0;
-                }
-                prev_tail = None;
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            empty_ticks = 0;
+            let confirm: std::collections::HashSet<String> = if got2 > 0 {
+                live_run(&win2[..got2], base, cands[p].start, cands[p].end).into_iter().map(|l| l.text).collect()
+            } else {
+                std::collections::HashSet::new()
+            };
 
             // Hold-back: the newest line is the one the game may still be
-            // writing (a torn read shows its partial text run into the stale
-            // fragment behind it). It is consumed only once its text reads the
-            // same on two consecutive ticks, or a newer line follows it.
-            let tail = lines.last().map(|(_, l)| l.clone());
-            let stable = tail == prev_tail;
-            prev_tail = tail;
+            // writing; it is consumed only once it reads the same on two
+            // consecutive ticks, or a newer line follows it.
+            let stable = !cands[p].changed_now;
 
             // Where do the new lines start?
-            let from = match &anchor {
+            let from = match &cands[p].anchor {
                 None => {
                     // seed to the end without replaying the backlog
-                    anchor = Some(Anchor::seed(&lines, lines.len() - 1));
+                    cands[p].anchor = Some(Anchor::seed(&lines, lines.len() - 1));
                     lines.len()
                 }
                 Some(a) => match a.find(&lines) {
                     Some(i) => i + 1,
                     None => {
-                        // Anchor vanished: the buffer was replaced under us (or
-                        // the first seed was a torn tail). Reseed rather than
-                        // guess; count it once real tailing had begun.
-                        if emitted_any {
+                        // Anchor vanished (buffer replaced under us, or the
+                        // first seed was a torn tail): reseed rather than guess.
+                        if cands[p].emitted_any {
                             resyncs += 1;
                         }
-                        anchor = Some(Anchor::seed(&lines, lines.len() - 1));
+                        cands[p].anchor = Some(Anchor::seed(&lines, lines.len() - 1));
                         lines.len()
                     }
                 },
             };
-            let to = if stable { lines.len() } else { lines.len() - 1 };
+            let mut to = if stable { lines.len() } else { lines.len() - 1 };
+            // stop at the first line the second read does not confirm; it is
+            // re-read next tick (nothing is skipped)
+            if let Some(i) = lines[from..to.max(from)].iter().position(|l| !confirm.contains(&l.text)) {
+                to = from + i;
+            }
 
             if from < to {
                 let ts = now_secs();
-                for (_, l) in &lines[from..to] {
-                    sink.line(l, ts);
+                for l in &lines[from..to] {
+                    sink.line_colored(&l.text, l.color, ts);
                 }
-                anchor = Some(Anchor::seed(&lines, to - 1));
+                cands[p].anchor = Some(Anchor::seed(&lines, to - 1));
                 sink.mark_fresh(ts);
-                last_new = ts;
-                emitted_any = true;
+                cands[p].emitted_any = true;
             }
 
-            let lab = label(region.unwrap(), resyncs, lines.len());
+            let mut lab = format!(
+                "(memory: pid {} region 0x{:08X}-0x{:08X}, {} lines, {} candidate region(s){})",
+                pid, cands[p].start, cands[p].end, cands[p].nlines, cands.len(),
+                if resyncs == 0 { String::new() } else { format!(", {} switches", resyncs) }
+            );
+            for c in &cands {
+                lab.push_str(&format!("
+   0x{:08X}-0x{:08X} {:4} lines{}", c.start, c.end, c.nlines,
+                    if c.last_change > 0.0 { format!(" moved {:.0}s ago", now - c.last_change) } else { String::new() }));
+            }
             if lab != last_label {
                 sink.set_log_label(&lab);
                 last_label = lab;
@@ -886,12 +1019,20 @@ pub mod memory {
               "memory: stale tail trimmed at FIRST numeric ' pts'");
         check(trim_combat("Yourname performs Killing Spree.@zCs@junk") == "Yourname performs Killing Spree.",
               "memory: performs line trimmed at period");
+        let vb = "Yourname attacks a giant baz nitch with Mine 2: Plasma Mine.And hits (8% evaded) for 489 points (489 energy).  Armor absorbed 254 points out of 743.junk";
+        check(trim_combat(vb) == "Yourname attacks a giant baz nitch with Mine 2: Plasma Mine.And hits (8% evaded) for 489 points (489 energy)"
+                  && combat_like(trim_combat(vb)) && grammar_ok(trim_combat(vb)),
+              "memory: verbose line trimmed after the breakdown and accepted");
+        check(trim_combat("Yourname attacks a kwi using [UA] T21 Rifle and misses (dodge).junk") == "Yourname attacks a kwi using [UA] T21 Rifle and misses (dodge).",
+              "memory: verbose miss trimmed at its period");
+        check(trim_combat("Yourname attacks a kwi with Mine 2: Plasma Mine.And hits for 533 points.junk") == "Yourname attacks a kwi with Mine 2: Plasma Mine.And hits for 533 points",
+              "memory: verbose line without damage detail trimmed after 'points'");
         check(combat_like("Yourname misses (dodge)") && combat_like("Yourname performs Heal 4.")
               && combat_like("An elder mamien has been incapacitated."),
               "memory: wide acceptor passes miss/performs/death");
         check(!combat_like("@terminal_name:terminal_bank$tDtn Yourname") && !grammar_ok("Yourname performs Heal 4."),
               "memory: junk rejected; strict locate grammar stays hit-only");
-        let l = |v: &[(usize, &str)]| v.iter().map(|(o, s)| (*o, s.to_string())).collect::<Vec<_>>();
+        let l = |v: &[(usize, &str)]| v.iter().map(|(o, s)| Line { off: *o, text: s.to_string(), color: None }).collect::<Vec<_>>();
         let t1 = l(&[(0, "A hits B 100 pts"), (50, "A hits B 100 pts"), (100, "A crits B 300 pts"), (150, "A hits B 100 pts")]);
         let t2 = l(&[(0, "A hits B 100 pts"), (50, "A hits B 100 pts"), (100, "A crits B 300 pts"), (150, "A hits B 100 pts"), (200, "A hits B 100 pts")]);
         let a = Anchor::seed(&t1, 1); // the second of two identical hits
@@ -900,6 +1041,19 @@ pub mod memory {
         let t3 = l(&[(10, "A hits B 100 pts"), (60, "A crits B 300 pts"), (110, "A hits B 100 pts"), (160, "A hits B 100 pts")]);
         let a2 = Anchor::seed(&t1, 3);
         check(a2.find(&t3) == Some(2), "memory: anchor resyncs after front-trim shift via context");
+        // color capture through the real UTF-16 decoder
+        let txt = "\\#50f111Yourname hits a kwi 500 pts\\#.\n\\#f30f0fA kwi hits Yourname 200 pts\\#.\nYourname misses (dodge)\\#.\n";
+        let mut win = Vec::new();
+        for u in txt.encode_utf16() {
+            win.extend_from_slice(&u.to_le_bytes());
+        }
+        win.extend_from_slice(&[0, 0]);
+        let ls = live_run(&win, 0, 0, 0x10000);
+        check(
+            ls.len() == 3 && ls[0].color == Some(0x50f111) && ls[1].color == Some(0xf30f0f) && ls[2].color.is_none()
+                && ls[0].text == "Yourname hits a kwi 500 pts",
+            "memory: line colors captured, text stripped",
+        );
     }
 }
 

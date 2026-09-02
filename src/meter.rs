@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event::{json_str, Event, Kind, Outcome};
+use crate::event::EntityKind;
 
 pub fn now_secs() -> f64 {
     SystemTime::now()
@@ -24,7 +25,14 @@ struct Ent {
     max: u64,
     deaths: u64,
     avoids: u64,
+    /// damage dealt, by ability
     abil: BTreeMap<String, u64>,
+    /// healing done, by ability and by recipient
+    habil: BTreeMap<String, u64>,
+    htgt: BTreeMap<String, u64>,
+    /// player / npc votes from the lines this entity appeared in
+    pv: u32,
+    nv: u32,
 }
 
 #[derive(Default, Clone)]
@@ -57,9 +65,19 @@ pub struct Meter {
     overall_dur: f64,
     encounter_count: u64,
 
-    // ability labeling: src -> (ability, ts)
-    last_abil: BTreeMap<String, (String, f64)>,
-    abil_window: f64,
+    // ability labeling: src -> (ability, announced-at, still fresh). "Fresh"
+    // means no other line from that source has arrived since the "performs"
+    // — the heal that belongs to a heal announcement is the very next line.
+    last_abil: BTreeMap<String, (String, f64, bool)>,
+    /// What each announced ability turned out to be (damage or heal), learned
+    /// from the first line it labeled — so "Heal 4" never labels a hit and
+    /// "Killing Spree" never labels a heal.
+    abil_kind: BTreeMap<String, Kind>,
+    /// Damage lines seen in verbose ("attacks ... for N points") vs terse
+    /// ("hits X N pts") form — shown on /debug. Verbose is the contract:
+    /// terse lines carry no ability, so they land in the "attack" bucket.
+    verbose_hits: u64,
+    terse_hits: u64,
 
     // stats / debug
     pub lines: u64,
@@ -82,7 +100,9 @@ impl Meter {
             overall_dur: 0.0,
             encounter_count: 0,
             last_abil: BTreeMap::new(),
-            abil_window: 6.0,
+            abil_kind: BTreeMap::new(),
+            verbose_hits: 0,
+            terse_hits: 0,
             lines: 0,
             events: 0,
             log_path: String::new(),
@@ -115,22 +135,46 @@ impl Meter {
 
         if ev.kind == Kind::Ability {
             if let Some(src) = &ev.src {
-                self.last_abil.insert(src.clone(), (ev.ability.clone(), ts));
+                self.last_abil.insert(src.clone(), (ev.ability.clone(), ts, true));
             }
             self.events += 1;
             return;
         }
 
-        // Label a generic hit/heal with the last announced ability.
-        if (ev.kind == Kind::Damage || ev.kind == Kind::Heal)
-            && (ev.ability == "attack" || ev.ability == "heal")
-        {
+        // Verbose damage lines name their ability: remember it is a damage
+        // ability so a heal announcement window can never adopt it.
+        if ev.kind == Kind::Damage && ev.ability != "attack" && ev.raw.contains(" attacks ") {
+            self.abil_kind.entry(ev.ability.clone()).or_insert(Kind::Damage);
+        }
+
+        if ev.kind == Kind::Damage {
+            if ev.raw.contains(" attacks ") {
+                self.verbose_hits += 1;
+            } else if ev.raw.trim_end().ends_with("pts") {
+                self.terse_hits += 1;
+            }
+        }
+
+        // Label a generic heal with the last announced ability ("performs
+        // Heal 4" then "X heals Y for N"). Damage is never labeled this way:
+        // verbose combat spam names the ability on the hit line itself, and a
+        // heal announcement must not label the auto-attacks that land in the
+        // same few seconds.
+        if ev.kind == Kind::Heal && ev.ability == "heal" {
             if let Some(src) = &ev.src {
-                if let Some((ab, at)) = self.last_abil.get(src) {
-                    if ts - at <= self.abil_window {
+                if let Some((ab, at, fresh)) = self.last_abil.get(src) {
+                    let known = self.abil_kind.get(ab).copied().or_else(|| abil_kind_hint(ab));
+                    if *fresh && ts - at <= 3.0 && known.map_or(true, |k| k == ev.kind) {
+                        self.abil_kind.entry(ab.clone()).or_insert(ev.kind);
                         ev.ability = ab.clone();
                     }
                 }
+            }
+        }
+
+        if let Some(src) = &ev.src {
+            if let Some(e) = self.last_abil.get_mut(src) {
+                e.2 = false;
             }
         }
 
@@ -252,6 +296,7 @@ impl Meter {
             s.push_str(&n.text);
             s.push('\n');
         }
+        s.push_str(&format!("damage lines: {} verbose, {} terse\n", self.verbose_hits, self.terse_hits));
         if self.unparsed.is_empty() {
             s.push_str("\nNo unparsed combat lines yet.\n");
         } else {
@@ -266,7 +311,33 @@ impl Meter {
     }
 }
 
+/// Kind of an announced ability from its name alone, before any line has
+/// told us: the obvious heal names never label damage.
+fn abil_kind_hint(ability: &str) -> Option<Kind> {
+    let a = ability.to_ascii_lowercase();
+    if ["heal", "bacta", "cure", "mend", "revive", "stim", "rejuven", "restor"].iter().any(|w| a.contains(w)) {
+        Some(Kind::Heal)
+    } else {
+        None
+    }
+}
+
+fn vote(ents: &mut BTreeMap<String, Ent>, name: &Option<String>, kind: EntityKind) {
+    if let Some(n) = name {
+        let e = ents.entry(n.clone()).or_default();
+        match kind {
+            EntityKind::Player => e.pv += 1,
+            EntityKind::Npc => e.nv += 1,
+            EntityKind::Unknown => {}
+        }
+    }
+}
+
 fn apply(ents: &mut BTreeMap<String, Ent>, ev: &Event) {
+    if ev.kind != Kind::Ability {
+        vote(ents, &ev.src, ev.src_kind);
+        vote(ents, &ev.tgt, ev.tgt_kind);
+    }
     match ev.kind {
         Kind::Damage => {
             if let Some(src) = &ev.src {
@@ -288,7 +359,12 @@ fn apply(ents: &mut BTreeMap<String, Ent>, ev: &Event) {
         }
         Kind::Heal => {
             if let Some(src) = &ev.src {
-                ents.entry(src.clone()).or_default().heal += ev.amount;
+                let e = ents.entry(src.clone()).or_default();
+                e.heal += ev.amount;
+                let ab = if ev.ability.is_empty() { "heal" } else { &ev.ability };
+                *e.habil.entry(ab.to_string()).or_default() += ev.amount;
+                let to = ev.tgt.clone().unwrap_or_else(|| src.clone());
+                *e.htgt.entry(to).or_default() += ev.amount;
             }
         }
         Kind::Death => {
@@ -315,11 +391,19 @@ fn merge(dst: &mut BTreeMap<String, Ent>, src: &BTreeMap<String, Ent>) {
         d.crits += e.crits;
         d.deaths += e.deaths;
         d.avoids += e.avoids;
+        d.pv += e.pv;
+        d.nv += e.nv;
         if e.max > d.max {
             d.max = e.max;
         }
         for (ab, v) in &e.abil {
             *d.abil.entry(ab.clone()).or_default() += *v;
+        }
+        for (ab, v) in &e.habil {
+            *d.habil.entry(ab.clone()).or_default() += *v;
+        }
+        for (t, v) in &e.htgt {
+            *d.htgt.entry(t.clone()).or_default() += *v;
         }
     }
 }
@@ -344,21 +428,34 @@ fn entities_enc_json(dur: f64, start: f64, ents: &BTreeMap<String, Ent>) -> Stri
     s
 }
 
-fn ent_json(e: &Ent) -> String {
-    let mut abil = String::from("{");
+fn map_json(m: &BTreeMap<String, u64>) -> String {
+    let mut s = String::from("{");
     let mut first = true;
-    for (k, v) in &e.abil {
+    for (k, v) in m {
         if !first {
-            abil.push(',');
+            s.push(',');
         }
         first = false;
-        abil.push_str(&json_str(k));
-        abil.push_str(&format!(":{}", v));
+        s.push_str(&json_str(k));
+        s.push_str(&format!(":{}", v));
     }
-    abil.push('}');
+    s.push('}');
+    s
+}
+
+fn ent_json(e: &Ent) -> String {
+    let abil = map_json(&e.abil);
+    let kind = if e.pv > e.nv {
+        "player"
+    } else if e.nv > e.pv {
+        "npc"
+    } else {
+        "unknown"
+    };
     format!(
         "{{\"dmg\":{},\"heal\":{},\"taken\":{},\"hits\":{},\"crits\":{},\
-         \"max\":{},\"deaths\":{},\"avoids\":{},\"abil\":{}}}",
-        e.dmg, e.heal, e.taken, e.hits, e.crits, e.max, e.deaths, e.avoids, abil
+         \"max\":{},\"deaths\":{},\"avoids\":{},\"kind\":\"{}\",\"abil\":{},\"habil\":{},\"htgt\":{}}}",
+        e.dmg, e.heal, e.taken, e.hits, e.crits, e.max, e.deaths, e.avoids, kind, abil,
+        map_json(&e.habil), map_json(&e.htgt)
     )
 }

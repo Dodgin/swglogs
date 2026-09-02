@@ -79,7 +79,12 @@ that needs no registry access.
 ## The two outputs
 
 **Meter page** — ranked bars, header cycles Now/Last/All and Damage/Healing/
-Taken; click a row for its ability breakdown (hits/crits/max). Shows a `⚠Ns`
+Taken and Players (default) / NPCs / Everyone. Click a row
+for its ability breakdown (hits/crits/max). Player vs NPC is judged from how
+the name appears in the line (NPC names arrive with an article or lowercase:
+"a kwi", "an elder mamien") and, on the memory source, pinned by the line's
+color — the client colors combat spam from your point of view: green your
+hits, orange your DoT ticks, red hits on you, light blue heals. Shows a `⚠Ns`
 staleness marker when the chatlog hasn't advanced (the game buffers its writes;
 our own log below does not).
 
@@ -103,6 +108,15 @@ away:
   buffer's own line text (the scrollback shifts on every append once it hits
   its line cap), and holds the newest line back one tick so a line caught
   mid-write is never consumed torn.
+
+**Verbose combat spam is required.** In the game's Options, under the combat
+spam settings: set **Combat Spam** to **Verbose** (not Brief), turn on **Show
+Weapon** (basic attacks are then labeled with the weapon), and set the combat
+spam **filter** to include your group if you want a group meter. Show Damage
+Detail and Show Armor Absorption are optional. Verbose lines name the ability
+on every hit, which is the only way damage can be attributed; brief lines
+("Shootin hits a kwi 500 pts") still count as damage but land in a plain
+"attack" bucket.
 
 - **chatlog** (`src/sources.rs::chatlog_tail`) — finds the newest
   `profiles/*/*/*_chatlog.txt`, tails it, parses each `[Combat]` line

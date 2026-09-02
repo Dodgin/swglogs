@@ -74,6 +74,19 @@ mod selftest {
         "[Combat]  You have sustained more poison!",
         "[Combat]  Yourname performs Heal 4.",
         "[Combat]  You have healed Yourname for 3465 points of damage.",
+        "[Combat]  Yourname hits a crystal snake 250 pts",
+        // verbose combat spam
+        "[Combat]  Yourname attacks a giant baz nitch with Sweeping Fire 3 and hits for 1179 points (1084 energy and 95 cold). Armor absorbed 613 points out of 1792.",
+        "[Combat]  Yourname attacks a giant baz nitch using [UA][Lvl90][Cold] T21 Rifle and hits (162 points blocked) for 454 points (359 energy and 95 cold). Armor absorbed 240 points out of 694.",
+        "[Combat]  Yourname attacks a giant baz nitch with Mine 2: Plasma Mine.And hits (8% evaded) for 489 points (489 energy).  Armor absorbed 254 points out of 743.",
+        "[Combat]  Yourname attacks a giant baz nitch using [UA][Lvl90][Cold] T21 Rifle and strikes through (24%) for 545 points (433 energy and 112 cold).",
+        "[Combat]  A giant baz nitch attacks Yourname with Bite (4) and hits (400 points blocked) for 159 points (159 kinetic). Armor absorbed 959 points out of 1118.",
+        "[Combat]  A giant baz nitch attacks Yourname and hits for 151 points (151 kinetic). Armor absorbed 259 points out of 410.",
+        "[Combat]  Yourname attacks a giant baz nitch using [UA][Lvl90][Cold] T21 Rifle and misses (dodge).",
+        // a damage announcement followed by its verbose hit, then a heal: the heal must NOT take the grenade's name
+        "[Combat]  Yourname performs Cryoban Grenade 2.",
+        "[Combat]  Yourname attacks a giant baz nitch with Cryoban Grenade 2 and hits for 100 points (100 acid).",
+        "[Combat]  Yourname heals Yourname for 50 points of damage.",
         "[Combat]  That target is out of range.",
         "[Combat]  Some future spam variant dealing 999 mystery hurt",
     ];
@@ -101,24 +114,78 @@ mod selftest {
         };
 
         // Yourname dmg: 844+973+1302+581(DoT)+337(glance)+500 = 4537
-        check(field(&snap, "Yourname", "dmg") == 844 + 973 + 1302 + 581 + 337 + 500,
+        let verbose_out = 1179 + 454 + 489 + 545 + 100;
+        check(field(&snap, "Yourname", "dmg") == 844 + 973 + 1302 + 581 + 337 + 500 + 250 + verbose_out,
               "Yourname damage incl. glance + DoT + post-perform hit");
         check(field(&snap, "Yourname", "crits") == 1, "Yourname crit counted");
-        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296,
-              "Yourname taken incl. strikes-through + poison tick (1047)");
-        check(field(&snap, "Yourname", "avoids") == 1, "Yourname miss counted");
-        check(field(&snap, "Yourname", "heal") == 3465, "player heal 3465");
+        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296 + 159 + 151,
+              "Yourname taken incl. strikes-through + poison tick + verbose hits");
+        check(field(&snap, "Yourname", "avoids") == 2, "Yourname misses counted (terse + verbose)");
+        check(field(&snap, "Giant baz nitch", "taken") == verbose_out && field(&snap, "Giant baz nitch", "dmg") == 159 + 151,
+              "verbose: giant baz nitch taken/dealt");
+        check(has_ability(&snap, "Yourname", "Sweeping Fire 3") && has_ability(&snap, "Yourname", "T21 Rifle")
+                  && has_ability(&snap, "Yourname", "Mine 2: Plasma Mine") && has_ability(&snap, "Giant baz nitch", "Bite (4)"),
+              "verbose: abilities read off the line; weapon tags stripped");
+        check(field(&snap, "Yourname", "heal") == 3465 + 50, "player heal 3515");
+        check(!has_in(&snap, "Yourname", "habil", "Cryoban Grenade 2") && has_in(&snap, "Yourname", "habil", "heal")
+                  && has_ability(&snap, "Yourname", "Cryoban Grenade 2"),
+              "heal after a damage announcement + its hit is NOT labeled with the grenade");
+        check(has_in(&snap, "Yourname", "habil", "Heal 4") && has_in(&snap, "Yourname", "htgt", "Yourname"),
+              "healing split by ability ('Heal 4') and by recipient");
         check(field(&snap, "Elder mamien", "dmg") == 174, "elder mamien dmg 174 (crit+blocked)");
         check(field(&snap, "Elder mamien", "taken") == 3700, "elder mamien taken 3700");
         check(field(&snap, "Crystal snake", "dmg") == 396, "crystal snake dmg 396");
-        check(field(&snap, "Crystal snake", "taken") == 337 + 500, "crystal snake taken 837");
+        check(field(&snap, "Crystal snake", "taken") == 337 + 500 + 250, "crystal snake taken 1087");
         check(field(&snap, "Mamien youth", "dmg") == 181, "mamien youth dmg 181");
         check(unparsed == 1, "only the unknown variant is unparsed (noise filtered)");
-        check(has_ability(&snap, "Yourname", "Killing Spree"), "hit labeled 'Killing Spree'");
+        check(!has_ability(&snap, "Yourname", "Killing Spree"),
+              "terse hit is NOT window-labeled from 'performs' (verbose is the contract)");
         check(has_ability(&snap, "Yourname", "fire damage"), "DoT labeled 'fire damage'");
+        check(!has_ability(&snap, "Yourname", "Heal 4"), "hit after 'performs Heal 4' is NOT labeled as the heal");
         check(fmt_ts(1_756_744_800.0).starts_with("2025-"), "fmt_ts civil date sane");
         swglogs::sources::memory::selfcheck(&mut check);
         swglogs::uipatch::selfcheck(&mut check);
+        {
+            use swglogs::event::EntityKind as K;
+            let k = |line: &str, color: Option<u32>| match swglogs::parse::parse_line_colored(line, 1.0, color) {
+                Parsed::Event(e) => (e.src_kind, e.tgt_kind),
+                _ => (K::Unknown, K::Unknown),
+            };
+            check(k("[Combat]  Yourname hits an elder mamien 844 pts", None) == (K::Player, K::Npc),
+                  "kinds: bare capitalized name = player, article = npc");
+            check(k("[Combat]  A crystal snake strikes through Yourname 396 pts", None) == (K::Npc, K::Player),
+                  "kinds: leading article npc -> player");
+            check(k("[Combat]  You have healed Yourname for 3465 points of damage.", None) == (K::Player, K::Player),
+                  "kinds: You is the player");
+            check(k("Axkva Min hits Yourname 500 pts", Some(0xf30f0f)).1 == K::Player
+                      && k("Yourname hits Axkva Min 500 pts", Some(0x50f111)).0 == K::Player
+                      && k("Kestra heals Yourname for 200 points of damage.", Some(0x1bb9c7)) == (K::Player, K::Player),
+                  "kinds: red/green/blue color pins the local player");
+            let ent = |name: &str| -> String {
+                let key = format!("\"{}\":{{", name);
+                let o = snap.find("\"overall\":").unwrap_or(0);
+                let i = snap[o..].find(&key).map(|j| o + j).unwrap_or(0);
+                let seg = &snap[i..];
+                seg[..seg.find("}}").map(|x| x + 2).unwrap_or(seg.len())].to_string()
+            };
+            check(ent("Elder mamien").contains("\"kind\":\"npc\"") && ent("Yourname").contains("\"kind\":\"player\"")
+                      && ent("Giant baz nitch").contains("\"kind\":\"npc\""),
+                  "snapshot: entities carry a player/npc kind");
+            let vb = |line: &str| match swglogs::parse::parse_line(line, 1.0) {
+                Parsed::Event(e) => (e.amount, e.outcome, e.ability),
+                _ => (u64::MAX, swglogs::event::Outcome::Normal, String::new()),
+            };
+            check(vb("Yourname attacks a giant baz nitch using [UA][Lvl90][Cold] T21 Rifle and hits (162 points blocked) for 454 points (359 energy and 95 cold).")
+                      == (454, swglogs::event::Outcome::Blocked, "T21 Rifle".to_string()),
+                  "verbose: '(N points blocked)' -> blocked, weapon as ability");
+            check(vb("Yourname attacks a giant baz nitch with Mine 2: Plasma Mine.And hits (8% evaded) for 489 points (489 energy).")
+                      == (489, swglogs::event::Outcome::Evaded, "Mine 2: Plasma Mine".to_string()),
+                  "verbose: '.And' after a dotted ability name, '(N% evaded)' -> evaded");
+            check(vb("Yourname attacks a giant baz nitch and crits for 900 points.")
+                      == (900, swglogs::event::Outcome::Critical, "attack".to_string()),
+                  "verbose: no weapon clause, no damage detail -> still parses");
+
+        }
         {
             let mut m2 = Meter::new(8.0, None);
             m2.notice = Some(swglogs::meter::Notice { text: "x".into(), client_pid: Some(1) });
@@ -158,6 +225,11 @@ mod selftest {
     }
 
     fn has_ability(snap: &str, entity: &str, ability: &str) -> bool {
+        has_in(snap, entity, "abil", ability)
+    }
+
+    /// Does `entity`'s `map` object ("abil", "habil", "htgt") in "overall" hold `key`?
+    fn has_in(snap: &str, entity: &str, map: &str, key: &str) -> bool {
         let ov = match snap.find("\"overall\":") {
             Some(i) => &snap[i..],
             None => return false,
@@ -167,9 +239,13 @@ mod selftest {
             Some(i) => i,
             None => return false,
         };
-        // the entity object ends at the first "}}" (closes abil then entity)
         let seg = &ov[start..];
-        let end = seg.find("}}").map(|i| i + 2).unwrap_or(seg.len());
-        seg[..end].contains(&format!("\"{}\":", ability))
+        let mk = format!("\"{}\":{{", map);
+        let ms = match seg.find(&mk) {
+            Some(i) => i + mk.len(),
+            None => return false,
+        };
+        let me = seg[ms..].find('}').map(|i| ms + i).unwrap_or(seg.len());
+        seg[ms..me].contains(&format!("\"{}\":", key))
     }
 }

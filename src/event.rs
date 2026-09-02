@@ -71,6 +71,53 @@ impl Outcome {
     }
 }
 
+/// Player or NPC. Judged from how the name appears in the line — NPC names
+/// arrive with an article or in lowercase ("a kwi", "an elder mamien"),
+/// player names are bare and capitalized — and, for the local player's own
+/// lines, pinned by the line's color (see [`color_role`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntityKind {
+    Player,
+    Npc,
+    Unknown,
+}
+
+impl EntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntityKind::Player => "player",
+            EntityKind::Npc => "npc",
+            EntityKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a scrollback line's color says about it. The client colors combat
+/// spam from the local player's point of view; observed on SWG Legends:
+/// green `50f111` your hits, orange `f17104` your DoT ticks / absorbed hits,
+/// cyan `21e6f7` your glances, red `f30f0f` hits on you, light blue `1bb9c7`
+/// heals, white ability announcements + system text, yellow `f4ef1d` NPC
+/// misses, dark red `a70d0d` "out of range"-style errors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorRole {
+    /// The local player dealt it: `src` is the player.
+    Outgoing,
+    /// The local player took it: `tgt` is the player.
+    Incoming,
+    /// A heal: both ends are players.
+    Heal,
+    Other,
+}
+
+pub fn color_role(rgb: u32) -> ColorRole {
+    match rgb {
+        0x50f111 | 0xf17104 | 0x21e6f7 => ColorRole::Outgoing,
+        0xf30f0f => ColorRole::Incoming,
+        0x1bb9c7 => ColorRole::Heal,
+        _ => ColorRole::Other,
+    }
+}
+
 /// One normalized combat event.
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -86,6 +133,11 @@ pub struct Event {
     pub ability: String,
     /// The original text the event was parsed from (kept for the log's `raw`).
     pub raw: String,
+    pub src_kind: EntityKind,
+    pub tgt_kind: EntityKind,
+    /// The line's `\#RRGGBB` color when the source carries one (memory
+    /// scrollback); chatlog files have no colors.
+    pub color: Option<u32>,
 }
 
 impl Event {
@@ -101,6 +153,12 @@ impl Event {
         s.push_str(&format!(",\"amount\":{}", self.amount));
         s.push_str(&format!(",\"outcome\":{}", json_str(self.outcome.as_str())));
         s.push_str(&format!(",\"ability\":{}", json_str(&self.ability)));
+        s.push_str(&format!(",\"src_kind\":{}", json_str(self.src_kind.as_str())));
+        s.push_str(&format!(",\"tgt_kind\":{}", json_str(self.tgt_kind.as_str())));
+        match self.color {
+            Some(c) => s.push_str(&format!(",\"color\":\"{:06x}\"", c)),
+            None => s.push_str(",\"color\":null"),
+        }
         s.push_str(&format!(",\"raw\":{}", json_str(&self.raw)));
         s.push('}');
         s

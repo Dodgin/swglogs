@@ -21,25 +21,34 @@ button{background:#1d222a;color:#aeb6bf;border:1px solid #2b323c;border-radius:3
   -webkit-justify-content:space-between;justify-content:space-between;
   padding:1px 5px;text-shadow:0 1px 2px rgba(0,0,0,.8);white-space:nowrap}
 .me .lbl .n{color:#ffd76e;font-weight:bold}
-.abil{font-size:10px;color:#8b95a1;padding:1px 10px 3px}
+.arr{display:inline-block;width:10px;color:#8b95a1;font-size:9px}
+.sub{position:relative;height:14px;margin:1px 0 1px 18px;background:#111318;
+  border-radius:2px;overflow:hidden;font-size:10px}
+.sub .bar{opacity:.55}
+.sub .lbl{padding:0 5px;color:#c3cad2}
+.sep{height:1px;margin:4px 0 4px 18px;background:#2b323c}
+.abil{font-size:10px;color:#8b95a1;padding:1px 10px 3px 23px}
 #empty{color:#4c545e;text-align:center;padding:18px 6px}
 </style></head><body>
 <div id="hdr"><span class="t">SWG Logs</span>
-<button id="bView">Now</button><button id="bMode">Damage</button><button id="bClear">Clear</button>
+<button id="bView">Now</button><button id="bMode">Damage</button><button id="bSrc">Players</button><button id="bClear">Clear</button>
 <span id="meta"></span></div>
 <div id="notice"></div>
 <div id="rows"><div id="empty">waiting for data&hellip;</div></div>
 <script>
-var view='current', mode='dmg', open={}, data=null;
+var view='current', mode='dmg', open={}, data=null, src='players';
 if(location.pathname.indexOf('healing')>=0)mode='heal';
 else if(location.pathname.indexOf('taken')>=0)mode='taken';
 var VIEWS=['current','last','overall'];
 var MODES=['dmg','heal','taken'];
 var MODE_LBL={dmg:'Damage',heal:'Healing',taken:'Taken'};
 var VIEW_LBL={current:'Now',last:'Last',overall:'All'};
+var SRCS=['players','npcs','all'];
+var SRC_LBL={players:'Players',npcs:'NPCs',all:'Everyone'};
 function $(id){return document.getElementById(id);}
 $('bView').onclick=function(){view=VIEWS[(indexOf(VIEWS,view)+1)%3];render();};
 $('bMode').onclick=function(){mode=MODES[(indexOf(MODES,mode)+1)%3];render();};
+$('bSrc').onclick=function(){src=SRCS[(indexOf(SRCS,src)+1)%3];render();};
 $('bClear').onclick=function(){var x=new XMLHttpRequest();
   x.open('GET','/clear',true);
   x.onreadystatechange=function(){if(x.readyState===4&&x.status===200){
@@ -67,6 +76,7 @@ function src(){var l=data&&data.meta&&data.meta.log;
 function render(){
   $('bView').textContent=VIEW_LBL[view];
   $('bMode').textContent=MODE_LBL[mode];
+  $('bSrc').textContent=SRC_LBL[src];
   var rowsEl=$('rows');
   if(!data){return;}
   var nt=$('notice'),msg=data.meta&&data.meta.notice;
@@ -82,6 +92,9 @@ function render(){
   $('meta').textContent=mmss(dur)+idle+fresh;
   var arr=[],n,e,v;
   for(n in enc.entities){e=enc.entities[n];
+    var k=e.kind||'unknown';
+    if(src==='players'&&k==='npc')continue;
+    if(src==='npcs'&&k!=='npc')continue;
     v=mode==='dmg'?e.dmg:mode==='heal'?e.heal:e.taken;
     if(v>0)arr.push([n,v,e]);}
   arr.sort(function(a,b){return b[1]-a[1];});
@@ -94,17 +107,34 @@ function render(){
   for(i=0;i<arr.length;i++){
     n=arr[i][0];v=arr[i][1];e=arr[i][2];
     var pct=Math.round(v*100/total);
+    // breakdown sections: damage -> by ability; healing -> by ability, then by recipient
+    var secs=[],ab,sm;
+    if(mode==='dmg')secs.push(e.abil);
+    else if(mode==='heal'){secs.push(e.habil);secs.push(e.htgt);}
+    var sections=[];
+    for(var si=0;si<secs.length;si++){var items=[];sm=secs[si]||{};
+      for(ab in sm)items.push([ab,sm[ab]]);
+      items.sort(function(a,b){return b[1]-a[1];});
+      if(items.length)sections.push(items);}
+    var canOpen=sections.length>0;
+    var arrow=canOpen?'<span class="arr">'+(open[n]?'&#9660;':'&#9654;')+'</span>':'<span class="arr"></span>';
     h+='<div class="row'+(n===me?' me':'')+'" data-n="'+esc(n)+'">'
       +'<div class="bar" style="width:'+(v*100/max)+'%;background:'+color(n)+'"></div>'
-      +'<div class="lbl"><span class="n">'+(i+1)+'. '+esc(n)+'</span>'
+      +'<div class="lbl"><span class="n">'+arrow+(i+1)+'. '+esc(n)+'</span>'
       +'<span>'+fmt(v)+' ('+fmt(v/dur)+', '+pct+'%)</span></div></div>';
-    if(open[n]&&mode==='dmg'&&e.abil){
-      var abs=[],ab;
-      for(ab in e.abil)abs.push([ab,e.abil[ab]]);
-      abs.sort(function(a,b){return b[1]-a[1];});
-      for(var j=0;j<abs.length&&j<6;j++)
-        h+='<div class="abil">'+esc(abs[j][0])+' &mdash; '+fmt(abs[j][1])+'</div>';
-      h+='<div class="abil">'+e.hits+' hits, '+e.crits+' crits, max '
+    if(open[n]&&canOpen){
+      for(var si2=0;si2<sections.length;si2++){
+        if(si2>0)h+='<div class="sep"></div>';
+        var abs=sections[si2];
+        // each bar fills by its share of THIS entity's total in the current view
+        for(var j=0;j<abs.length&&j<8;j++){
+          var share=v>0?abs[j][1]*100/v:0;
+          h+='<div class="sub"><div class="bar" style="width:'+share+'%;background:'+color(n)+'"></div>'
+            +'<div class="lbl"><span>'+esc(abs[j][0])+'</span>'
+            +'<span>'+fmt(abs[j][1])+' ('+Math.round(share)+'%)</span></div></div>';
+        }
+      }
+      if(mode==='dmg')h+='<div class="abil">'+e.hits+' hits, '+e.crits+' crits, max '
         +fmt(e.max)+'</div>';
     }
   }
