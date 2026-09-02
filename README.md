@@ -1,5 +1,7 @@
 # swglogs
 
+[![CI](https://github.com/Dodgin/swglogs/actions/workflows/ci.yml/badge.svg)](https://github.com/Dodgin/swglogs/actions/workflows/ci.yml)
+
 ![SWG Logs meter in the in-game browser](docs/readme-ex-1.png)
 
 SWG Legends combat logs + Details-style meter, in Rust. **One normalized
@@ -21,6 +23,9 @@ sources:  memory (default)      the client's combat scrollback, read directly   
 Core is dependency-free (std only); only the window pulls in egui (see below).
 
 ## Build & run
+
+Prebuilt `swglogs.exe`: every push to `main` uploads one as a CI artifact, and
+tagging `vX.Y` attaches it to a GitHub release. From source:
 
 ```
 cargo build --release
