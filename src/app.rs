@@ -31,6 +31,10 @@ pub struct Config {
     pub headless: bool,
     /// Undo the UI patch and exit.
     pub restore_ui: bool,
+    /// `--trace [DIR]`: memory-source diagnostic trace folder.
+    pub trace: Option<PathBuf>,
+    /// `--trace-replay DIR`: replay saved trace snapshots and exit.
+    pub trace_replay: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -51,6 +55,8 @@ impl Default for Config {
             ui_patch: true,
             headless: false,
             restore_ui: false,
+            trace: None,
+            trace_replay: None,
         }
     }
 }
@@ -84,6 +90,14 @@ pub fn parse_args() -> Config {
             "--no-ui-patch" => a.ui_patch = false,
             "--headless" => a.headless = true,
             "--restore-ui" => a.restore_ui = true,
+            "--trace" => {
+                // optional DIR: the next arg unless it is another flag
+                match argv.get(i + 1) {
+                    Some(d) if !d.starts_with("--") => a.trace = Some(PathBuf::from(next(&mut i))),
+                    _ => a.trace = Some(PathBuf::from("swglogs-trace")),
+                }
+            }
+            "--trace-replay" => a.trace_replay = Some(PathBuf::from(next(&mut i))),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -239,7 +253,17 @@ pub fn start(cfg: &Config) -> Running {
         None => None,
     };
 
-    let sink = Sink { meter: Arc::clone(&meter), log };
+    let trace = cfg.trace.as_ref().and_then(|dir| match crate::trace::Tracer::open(dir) {
+        Ok(t) => {
+            println!("[swglogs] trace: {}", t.dir.display());
+            Some(Arc::new(t))
+        }
+        Err(e) => {
+            eprintln!("[swglogs] could not open trace dir {}: {}", dir.display(), e);
+            None
+        }
+    });
+    let sink = Sink { meter: Arc::clone(&meter), log, trace };
 
     // spawn the chosen source
     {
