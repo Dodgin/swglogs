@@ -938,6 +938,8 @@ pub mod memory {
         buf: Vec<u8>,
         got: usize,
         warned_trunc: bool,
+        /// raw bytes of the newest confirmed line, for a Find
+        needle: Vec<u8>,
     }
 
     /// Where we are in the buffer: the last line we emitted, identified by the
@@ -1020,32 +1022,239 @@ pub mod memory {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // Scanner thread: the expensive whole-process work runs here so the
+    // follower never stops reading the buffer. Two jobs:
+    //   * Scan  — the full grammar scan (locates combat text from nothing;
+    //             ~20 s on a big client).
+    //   * Find  — search for the raw bytes of the buffer's last known line
+    //             (a reallocated scrollback carries the same text, so this
+    //             finds its new home in a second or two).
+    // ----------------------------------------------------------------------
+
+    enum Req {
+        Scan(&'static str),
+        Find { reason: &'static str, needle: Vec<u8>, skip: Vec<(usize, usize)> },
+    }
+
+    struct ScanRes {
+        reason: &'static str,
+        bins: std::collections::HashMap<usize, (u32, String)>,
+        bytes: usize,
+        ms: usize,
+    }
+
+    struct FindRes {
+        reason: &'static str,
+        needle: Vec<u8>,
+        bytes: usize,
+        ms: usize,
+        hits: Vec<usize>,
+        /// Exact extent of the string around each hit (start, end-after-NUL).
+        extents: Vec<(usize, usize)>,
+    }
+
+    enum Res {
+        Scan(ScanRes),
+        Find(FindRes),
+    }
+
+    fn scanner(pid: u32, req_rx: std::sync::mpsc::Receiver<Req>, res_tx: std::sync::mpsc::Sender<Res>) {
+        use std::time::Instant;
+        let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if h.is_null() {
+            return;
+        }
+        let p = Proc(h);
+        while let Ok(req) = req_rx.recv() {
+            let t = Instant::now();
+            let res = match req {
+                Req::Scan(reason) => {
+                    let (bins, bytes) = scan_bins(&p);
+                    Res::Scan(ScanRes { reason, bins, bytes, ms: t.elapsed().as_millis() as usize })
+                }
+                Req::Find { reason, needle, skip } => {
+                    let (hits, bytes) = find_bytes(&p, &needle, &skip);
+                    let mut extents: Vec<(usize, usize)> = Vec::new();
+                    for &a in &hits {
+                        if extents.iter().any(|&(lo, hi)| (lo..hi).contains(&a)) {
+                            continue;
+                        }
+                        if let Some(e) = string_extent(&p, a) {
+                            extents.push(e);
+                        }
+                    }
+                    Res::Find(FindRes { reason, needle, bytes, ms: t.elapsed().as_millis() as usize, hits, extents })
+                }
+            };
+            if res_tx.send(res).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// First occurrence of `needle` in `hay`.
+    fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        let first = needle[0];
+        let last_start = hay.len() - needle.len();
+        let mut i = 0;
+        while i <= last_start {
+            match hay[i..=last_start].iter().position(|&b| b == first) {
+                None => return None,
+                Some(k) => {
+                    i += k;
+                    if &hay[i..i + needle.len()] == needle {
+                        return Some(i);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Every address in the client's private memory where `needle` occurs,
+    /// outside the `skip` spans; plus bytes read. Stops after 64 hits.
+    fn find_bytes(p: &Proc, needle: &[u8], skip: &[(usize, usize)]) -> (Vec<usize>, usize) {
+        let mut hits: Vec<usize> = Vec::new();
+        let mut bytes = 0usize;
+        let mut buf = vec![0u8; 0x100000];
+        for (base, size) in p.regions() {
+            let mut addr = base;
+            let end = base + size;
+            while addr < end {
+                let len = (end - addr).min(buf.len());
+                let got = p.read(addr, &mut buf[..len]);
+                if got == 0 {
+                    break;
+                }
+                bytes += got;
+                let mut from = 0;
+                while let Some(i) = memmem(&buf[from..got], needle) {
+                    let a = addr + from + i;
+                    if !skip.iter().any(|&(lo, hi)| (lo..hi).contains(&a)) && hits.last() != Some(&a) {
+                        hits.push(a);
+                        if hits.len() >= 64 {
+                            return (hits, bytes);
+                        }
+                    }
+                    from += i + 2;
+                }
+                if addr + got >= end {
+                    break;
+                }
+                // overlap by the needle so a straddling match is still seen
+                addr += if got > needle.len() { got - needle.len() + 1 } else { got };
+            }
+        }
+        (hits, bytes)
+    }
+
+    /// The NUL-delimited UTF-16 string containing `addr`: (start, end just
+    /// past its terminator). Looks at most 2 MiB each way.
+    fn string_extent(p: &Proc, addr: usize) -> Option<(usize, usize)> {
+        const MAX: usize = 0x200000;
+        let mut buf = vec![0u8; MAX];
+        // backward: the last NUL (same parity as addr) before it
+        let lo_base = addr.saturating_sub(MAX);
+        let blen = addr - lo_base;
+        let start = if blen >= 2 && p.read(lo_base, &mut buf[..blen]) > 0 {
+            let mut k = blen;
+            let mut s = lo_base;
+            while k >= 2 {
+                k -= 2;
+                if buf[k] == 0 && buf[k + 1] == 0 {
+                    s = lo_base + k + 2;
+                    break;
+                }
+            }
+            s
+        } else {
+            addr
+        };
+        // forward: the first NUL at or after addr
+        let got = p.read(addr, &mut buf[..MAX]);
+        if got < 2 {
+            return None;
+        }
+        let mut k = 0;
+        let mut end = addr + got;
+        while k + 1 < got {
+            if buf[k] == 0 && buf[k + 1] == 0 {
+                end = addr + k + 2;
+                break;
+            }
+            k += 2;
+        }
+        if end <= start {
+            return None;
+        }
+        Some((start, end))
+    }
+
+    fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+        a.0 < b.1 && b.0 < a.1
+    }
+
+    /// Raw bytes of the line starting at `off` in `win`, through its
+    /// terminator exclusive, capped; None if too short to be a useful needle.
+    fn raw_line(win: &[u8], off: usize) -> Option<Vec<u8>> {
+        const CAP: usize = 240;
+        let mut k = off;
+        while k + 1 < win.len() && k - off < CAP {
+            let c = (win[k] as u16) | ((win[k + 1] as u16) << 8);
+            if c == 0x0A || c == 0x0D || c == 0 {
+                break;
+            }
+            k += 2;
+        }
+        if k - off >= 32 { Some(win[off..k].to_vec()) } else { None }
+    }
+
     /// Track one client process's combat text until that process exits.
     fn follow(sink: &Sink, proc: &Proc, pid: u32) {
         use crate::trace::{Rec, Tracer};
+        use std::sync::mpsc;
         use std::time::Instant;
 
         const SLACK: usize = 0x8000; // read this much before/after a region
-        const WIN: usize = 0x80000; // up to 512 KiB per candidate read
+        const WIN: usize = 0x400000; // up to 4 MiB per candidate read
         let tr: Option<&Tracer> = sink.trace.as_deref();
         let trace_suffix = tr.map(|t| format!(", trace → {}", t.dir.display())).unwrap_or_default();
         let mut cands: Vec<Cand> = Vec::new();
         let mut primary: Option<usize> = None;
         let mut last_scan = 0.0f64;
+        let mut last_find = 0.0f64;
+        let mut in_flight: Option<&'static str> = None;
         let mut resyncs = 0u32;
         let mut last_label = String::new();
         let mut last_tick_rec = 0.0f64;
         let mut last_hb_snap = 0.0f64;
         let mut last_torn_snap = 0.0f64;
-        let mut win2 = vec![0u8; WIN]; // second read of the primary: torn-read check
+        let mut win2: Vec<u8> = Vec::new(); // second read of the primary: torn-read check
         let pinned = std::env::var("SWGLOGS_MEMREGION").ok()
             .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok());
         let short = |s: &str| -> String { s.chars().take(96).collect() };
         let snap_lines = |lines: &[Line]| -> Vec<(usize, String)> { lines.iter().map(|l| (l.off, l.text.clone())).collect() };
+        let new_cand = |st: usize, en: usize| Cand {
+            start: st, end: en, anchor: None, prev_tail: None, last_change: 0.0,
+            changed_now: false, empty_ticks: 0, nlines: 0, emitted_any: false,
+            buf: Vec::new(), got: 0, warned_trunc: false, needle: Vec::new(),
+        };
+
+        let (req_tx, req_rx) = mpsc::channel::<Req>();
+        let (res_tx, res_rx) = mpsc::channel::<Res>();
+        std::thread::spawn(move || scanner(pid, req_rx, res_tx));
 
         if let Some(t) = tr {
             t.rec(Rec::new("start", now_secs()).u("pid", pid as usize).s("version", env!("CARGO_PKG_VERSION"))
                 .b("pinned", pinned.is_some()));
+        }
+        if let Some(r) = pinned {
+            cands.push(new_cand(r, r + 0x10000));
         }
 
         loop {
@@ -1054,7 +1263,7 @@ pub mod memory {
                 let mut m = sink.meter.lock().unwrap();
                 m.tick(now_secs());
             }
-            let mut now = now_secs();
+            let now = now_secs();
             if !proc.alive() {
                 if let Some(t) = tr {
                     t.rec(Rec::new("exit", now).u("pid", pid as usize));
@@ -1064,94 +1273,130 @@ pub mod memory {
             let mut scanned = false;
             let mut snap_tags: Vec<&'static str> = Vec::new();
 
-            // (Re)scan the client for combat text: at start, whenever nothing
-            // is being followed, every 10 s while the followed region has been
-            // quiet for 20 s (it may have been reallocated), else every 10 min.
-            // A freshly started client has no combat text at all until the
-            // first fight; rescan every 5 s in that state.
-            let idle = primary.map_or(true, |p| now - cands[p].last_change > 20.0);
-            let reason = if last_scan == 0.0 {
-                Some("initial")
-            } else if cands.is_empty() && now - last_scan > 5.0 {
-                Some("no-candidates")
-            } else if primary.is_none() && now - last_scan > 10.0 {
-                Some("no-primary")
-            } else if idle && now - last_scan > 10.0 {
-                Some("idle")
-            } else if now - last_scan > 600.0 {
-                // A moving region IS the live buffer; the idle rule above
-                // catches a reallocation. This is only a safety net, and a
-                // scan blocks the follower for many seconds, so it is rare.
-                Some("periodic")
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                scanned = true;
-                last_scan = now;
-                let ts = Instant::now();
-                let (bins, bytes) = match pinned {
-                    Some(_) => (std::collections::HashMap::new(), 0usize),
-                    None => scan_bins(proc),
-                };
-                let regions = match pinned {
-                    Some(r) => vec![(r, r + 0x10000)],
-                    None => candidates(&bins),
-                };
-                let scan_ms = ts.elapsed().as_millis() as usize;
-                let prim_region = primary.map(|p| (cands[p].start, cands[p].end));
-                let mut next: Vec<Cand> = Vec::with_capacity(regions.len());
-                let mut desc: Vec<String> = Vec::new();
-                for (st, en) in regions {
-                    if tr.is_some() {
-                        let mut n = 0u32;
-                        let mut last = String::new();
-                        let mut b = st;
-                        while b < en {
-                            if let Some((c, l)) = bins.get(&(b >> 16)) {
-                                n += c;
-                                last = l.clone();
+            // Results from the scanner thread.
+            while let Ok(res) = res_rx.try_recv() {
+                in_flight = None;
+                match res {
+                    Res::Scan(sr) => {
+                        scanned = true;
+                        let regions = candidates(&sr.bins);
+                        let prim_region = primary.map(|p| (cands[p].start, cands[p].end));
+                        // Keep every known candidate the scan still sees
+                        // (its extent may be exact, from a Find); add the
+                        // regions that overlap nothing known; drop the rest.
+                        let mut desc: Vec<String> = Vec::new();
+                        if tr.is_some() {
+                            for &(st, en) in &regions {
+                                let mut n = 0u32;
+                                let mut last = String::new();
+                                let mut b = st;
+                                while b < en {
+                                    if let Some((c, l)) = sr.bins.get(&(b >> 16)) {
+                                        n += c;
+                                        last = l.clone();
+                                    }
+                                    b += 0x10000;
+                                }
+                                desc.push(Tracer::obj(&[
+                                    ("region", crate::event::json_str(&format!("0x{:08X}-0x{:08X}", st, en))),
+                                    ("hits", n.to_string()),
+                                    ("last", crate::event::json_str(&short(&last))),
+                                    ("known", cands.iter().any(|c| overlaps((c.start, c.end), (st, en))).to_string()),
+                                ]));
                             }
-                            b += 0x10000;
                         }
-                        desc.push(Tracer::obj(&[
-                            ("region", crate::event::json_str(&format!("0x{:08X}-0x{:08X}", st, en))),
-                            ("hits", n.to_string()),
-                            ("last", crate::event::json_str(&short(&last))),
-                            ("known", cands.iter().any(|c| c.start == st && c.end == en).to_string()),
-                        ]));
+                        let (kept, gone): (Vec<Cand>, Vec<Cand>) = std::mem::take(&mut cands).into_iter()
+                            .partition(|c| pinned.is_some() || regions.iter().any(|&r| overlaps((c.start, c.end), r)));
+                        cands = kept;
+                        for &(st, en) in &regions {
+                            if !cands.iter().any(|c| overlaps((c.start, c.end), (st, en))) {
+                                cands.push(new_cand(st, en));
+                            }
+                        }
+                        primary = prim_region.and_then(|r| cands.iter().position(|c| (c.start, c.end) == r));
+                        if let Some(t) = tr {
+                            let gone: Vec<String> = gone.iter().map(|c| format!("0x{:08X}-0x{:08X}", c.start, c.end)).collect();
+                            t.rec(Rec::new("scan", now).s("reason", sr.reason).u("ms", sr.ms).u("bytes", sr.bytes)
+                                .raw_arr("candidates", &desc).strs("gone", &gone)
+                                .b("primary_kept", primary.is_some()));
+                        }
+                        snap_tags.push("scan");
                     }
-                    match cands.iter().position(|c| c.start == st && c.end == en) {
-                        Some(i) => next.push(cands.swap_remove(i)),
-                        None => next.push(Cand {
-                            start: st, end: en, anchor: None, prev_tail: None, last_change: 0.0,
-                            changed_now: false, empty_ticks: 0, nlines: 0, emitted_any: false,
-                            buf: Vec::new(), got: 0, warned_trunc: false,
-                        }),
+                    Res::Find(fr) => {
+                        let mut added: Vec<String> = Vec::new();
+                        for &(lo, hi) in &fr.extents {
+                            if hi - lo > WIN - 2 * SLACK {
+                                continue;
+                            }
+                            if !cands.iter().any(|c| overlaps((c.start, c.end), (lo, hi))) {
+                                cands.push(new_cand(lo, hi));
+                                added.push(format!("0x{:08X}-0x{:08X}", lo, hi));
+                            }
+                        }
+                        if let Some(t) = tr {
+                            let needle_txt: String = fr.needle.chunks(2)
+                                .map(|c| (c[0] as u16) | ((*c.get(1).unwrap_or(&0) as u16) << 8))
+                                .filter(|&u| (0x20..0x7F).contains(&u)).map(|u| u as u8 as char).collect();
+                            let hits: Vec<String> = fr.hits.iter().map(|a| format!("0x{:08X}", a)).collect();
+                            t.rec(Rec::new("find", now).s("reason", fr.reason).u("ms", fr.ms).u("bytes", fr.bytes)
+                                .s("needle", &short(&needle_txt)).strs("hits", &hits).strs("added", &added));
+                        }
                     }
-                }
-                let gone: Vec<String> = cands.iter().map(|c| format!("0x{:08X}-0x{:08X}", c.start, c.end)).collect();
-                cands = next;
-                primary = prim_region.and_then(|(st, en)| cands.iter().position(|c| c.start == st && c.end == en));
-                // The scan blocks for seconds: everything after it must use
-                // the current time, not the one from before the scan.
-                now = now_secs();
-                if let Some(t) = tr {
-                    t.rec(Rec::new("scan", now).s("reason", reason).u("ms", scan_ms).u("bytes", bytes)
-                        .raw_arr("candidates", &desc).strs("gone", &gone)
-                        .b("primary_kept", primary.is_some()));
-                }
-                snap_tags.push("scan");
-                if cands.is_empty() {
-                    sink.set_log_label(&format!(
-                        "(memory: pid {} — the client has no combat text yet (fresh login / no fight since it started);                          hit something and it appears within a few seconds){}",
-                        pid, trace_suffix
-                    ));
                 }
             }
 
+            // Ask the scanner for work. One job at a time. A full scan when
+            // nothing is known (fresh client) or nothing is being followed,
+            // and as a rare safety net; otherwise, once the followed buffer
+            // has been quiet a few seconds, a cheap search for its last line
+            // (which finds it again if the game reallocated it).
+            if in_flight.is_none() && pinned.is_none() {
+                let req = if last_scan == 0.0 {
+                    Some(Req::Scan("initial"))
+                } else if cands.is_empty() && now - last_scan > 15.0 {
+                    Some(Req::Scan("no-candidates"))
+                } else if primary.is_none() && now - last_scan > 30.0 {
+                    Some(Req::Scan("no-primary"))
+                } else if now - last_scan > 600.0 {
+                    Some(Req::Scan("periodic"))
+                } else if let Some(p) = primary {
+                    let c = &cands[p];
+                    let quiet = c.last_change > 0.0 && now - c.last_change > 3.0;
+                    if quiet && now - last_find > 10.0 && !c.needle.is_empty() {
+                        let skip = cands.iter().map(|c| (c.start.saturating_sub(SLACK), c.end + SLACK)).collect();
+                        Some(Req::Find { reason: "quiet", needle: c.needle.clone(), skip })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(req) = req {
+                    let what = match &req {
+                        Req::Scan(r) => { last_scan = now; *r }
+                        Req::Find { .. } => { last_find = now; "find" }
+                    };
+                    if req_tx.send(req).is_ok() {
+                        in_flight = Some(what);
+                    }
+                }
+            }
+            let flight_suffix = match in_flight {
+                Some("find") => ", searching for the buffer".to_string(),
+                Some(_) => ", full scan running".to_string(),
+                None => String::new(),
+            };
+
             if cands.is_empty() {
-                std::thread::sleep(Duration::from_millis(500));
+                let lab = format!(
+                    "(memory: pid {} — the client has no combat text yet (fresh login / no fight since it started);                          hit something and it appears within a few seconds{}{})",
+                    pid, flight_suffix, trace_suffix
+                );
+                if lab != last_label {
+                    sink.set_log_label(&lab);
+                    last_label = lab;
+                }
+                std::thread::sleep(Duration::from_millis(250));
                 continue;
             }
 
@@ -1236,7 +1481,7 @@ pub mod memory {
             let p = match primary {
                 Some(p) => p,
                 None => {
-                    let mut lab = format!("(memory: pid {} — {} candidate region(s); waiting for combat to see which one is live{})", pid, cands.len(), trace_suffix);
+                    let mut lab = format!("(memory: pid {} — {} candidate region(s); waiting for combat to see which one is live{}{})", pid, cands.len(), flight_suffix, trace_suffix);
                     for c in &cands {
                         lab.push_str(&format!("
    0x{:08X}-0x{:08X} {:4} lines{}", c.start, c.end, c.nlines,
@@ -1280,7 +1525,10 @@ pub mod memory {
             // Such a splice is transient, so a line is trusted only when a
             // second, immediate read of the window shows the same text.
             let base = cands[p].start.saturating_sub(SLACK);
-            let len = (cands[p].end + SLACK - base).min(win2.len());
+            let len = (cands[p].end + SLACK - base).min(WIN);
+            if win2.len() < len {
+                win2.resize(len, 0);
+            }
             let got2 = proc.read(base, &mut win2[..len]);
             let confirm_lines = if got2 > 0 {
                 live_run(&win2[..got2], base, cands[p].start, cands[p].end)
@@ -1362,6 +1610,17 @@ pub mod memory {
                 cands[p].emitted_any = true;
             }
 
+            // The needle for a later Find: the raw bytes of the newest line
+            // both reads agree on (the one before the held-back tail).
+            {
+                let idx = if to > 0 { to - 1 } else { lines.len() - 1 };
+                let idx = idx.min(lines.len() - 1);
+                let c = &mut cands[p];
+                if let Some(n) = raw_line(&c.buf[..c.got], lines[idx].off) {
+                    c.needle = n;
+                }
+            }
+
             let tick_ms = t0.elapsed().as_millis() as usize;
             if let Some(t) = tr {
                 let c = &cands[p];
@@ -1381,15 +1640,15 @@ pub mod memory {
                     t.snapshot(now, tag, base, c.start, c.end, &c.buf[..c.got], &snap_lines(&lines));
                 }
                 if tick_ms > 500 {
-                    t.rec(Rec::new("stall", now).u("ms", tick_ms).s("phase", if scanned { "scan" } else { "tick" }));
+                    t.rec(Rec::new("stall", now).u("ms", tick_ms).s("phase", "tick"));
                 }
             }
 
             let mut lab = format!(
-                "(memory: pid {} region 0x{:08X}-0x{:08X}, {} lines, {} candidate region(s){}{})",
+                "(memory: pid {} region 0x{:08X}-0x{:08X}, {} lines, {} candidate region(s){}{}{})",
                 pid, cands[p].start, cands[p].end, cands[p].nlines, cands.len(),
                 if resyncs == 0 { String::new() } else { format!(", {} switches", resyncs) },
-                trace_suffix
+                flight_suffix, trace_suffix
             );
             for c in &cands {
                 lab.push_str(&format!("
@@ -1577,6 +1836,14 @@ pub mod memory {
                 && ls[0].text == "Yourname hits a kwi 500 pts",
             "memory: line colors captured, text stripped",
         );
+        // scanner helpers
+        check(memmem(b"xxabcabd", b"abd") == Some(5) && memmem(b"abc", b"abcd").is_none() && memmem(b"aaab", b"ab") == Some(2),
+              "memory: memmem finds the first full match");
+        let raw: Vec<u8> = "Yourname hits a kwi 500 pts
+next".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        check(raw_line(&raw, 0).map(|n| n.len()) == Some("Yourname hits a kwi 500 pts".len() * 2) && raw_line(&raw, 56).is_none(),
+              "memory: needle is the raw line through its newline, short lines rejected");
+        check(overlaps((10, 20), (19, 30)) && !overlaps((10, 20), (20, 30)), "memory: region overlap is half-open");
         // trace snapshot names round-trip (used by --trace-replay)
         let n = crate::trace::parse_snapshot_name("win_1756800000123_switch-new_0A0B0C00_0A0B4000_0A0C0000.bin");
         check(
