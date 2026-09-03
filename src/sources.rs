@@ -828,8 +828,12 @@ pub mod memory {
                             _ => break,
                         }
                     }
-                    if hexn == 6 && cur.trim().is_empty() {
-                        color = Some(val); // the color the line starts in
+                    // The color the line starts in. With chat timestamps on
+                    // the code follows the "HH:MM:SS " prefix, so anything
+                    // timestamp-shaped before it still counts as "start".
+                    let pre = cur.trim();
+                    if hexn == 6 && pre.chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '[' | ']' | '(' | ')')) {
+                        color = Some(val);
                     }
                     k = j;
                     continue;
@@ -1824,7 +1828,7 @@ pub mod memory {
         let a2 = Anchor::seed(&t1, 3);
         check(a2.find(&t3) == Some(2), "memory: anchor resyncs after front-trim shift via context");
         // color capture through the real UTF-16 decoder
-        let txt = "\\#50f111Yourname hits a kwi 500 pts\\#.\n\\#f30f0fA kwi hits Yourname 200 pts\\#.\nYourname misses (dodge)\\#.\n";
+        let txt = "\\#50f111Yourname hits a kwi 500 pts\\#.\n10:03:46 \\#f30f0fA kwi hits Yourname 200 pts\\#.\nYourname misses (dodge)\\#.\n";
         let mut win = Vec::new();
         for u in txt.encode_utf16() {
             win.extend_from_slice(&u.to_le_bytes());
@@ -1834,7 +1838,7 @@ pub mod memory {
         check(
             ls.len() == 3 && ls[0].color == Some(0x50f111) && ls[1].color == Some(0xf30f0f) && ls[2].color.is_none()
                 && ls[0].text == "Yourname hits a kwi 500 pts",
-            "memory: line colors captured, text stripped",
+            "memory: line colors captured (also after a chat timestamp), text stripped",
         );
         // scanner helpers
         check(memmem(b"xxabcabd", b"abd") == Some(5) && memmem(b"abc", b"abcd").is_none() && memmem(b"aaab", b"ab") == Some(2),
