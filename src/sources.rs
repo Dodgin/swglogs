@@ -500,7 +500,30 @@ pub mod memory {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn ReadProcessMemory(h: Handle, addr: usize, buf: *mut u8, n: usize, read: *mut usize) -> i32;
         fn CloseHandle(h: Handle) -> i32;
+        fn VirtualQueryEx(h: Handle, addr: usize, info: *mut MemoryBasicInformation, len: usize) -> usize;
     }
+
+    /// MEMORY_BASIC_INFORMATION (64-bit layout; swglogs is a 64-bit process).
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct MemoryBasicInformation {
+        base: usize,
+        alloc_base: usize,
+        alloc_protect: u32,
+        _pad0: u32,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+        _pad1: u32,
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_PRIVATE: u32 = 0x20000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_GUARD: u32 = 0x100;
+    /// The client is a 32-bit large-address-aware process: on 64-bit Windows
+    /// its heap can sit anywhere below 4 GB, not just below 2 GB.
+    const SPACE_END: usize = 0xFFFF_0000;
 
     /// PID of the running game client, if any (used to notice a restart).
     pub fn client_pid() -> Option<u32> {
@@ -569,6 +592,33 @@ pub mod memory {
         }
     }
     impl Proc {
+        /// Committed, readable regions of the client as (base, size), in
+        /// address order, over the whole 4 GB space.
+        fn regions(&self) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let mut addr = 0x10000usize;
+            let mut mbi = MemoryBasicInformation::default();
+            while addr < SPACE_END {
+                let n = unsafe { VirtualQueryEx(self.0, addr, &mut mbi, std::mem::size_of::<MemoryBasicInformation>()) };
+                if n == 0 {
+                    break;
+                }
+                // The scrollback is a heap string: private memory. Images
+                // (exe/DLLs) and mapped files are skipped, which is most of
+                // the client's footprint.
+                let readable = mbi.state == MEM_COMMIT && mbi.kind == MEM_PRIVATE
+                    && mbi.protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && mbi.protect != 0;
+                if readable {
+                    out.push((mbi.base, mbi.region_size));
+                }
+                addr = match mbi.base.checked_add(mbi.region_size) {
+                    Some(a) if a > addr => a,
+                    _ => break,
+                };
+            }
+            out
+        }
+
         /// Still running? (A handle keeps working after the process exits â€”
         /// every read just fails â€” so this is checked explicitly.)
         fn alive(&self) -> bool {
@@ -580,12 +630,35 @@ pub mod memory {
             unsafe { GetExitCodeProcess(self.0, &mut code) != 0 && code == STILL_ACTIVE }
         }
 
+        /// Read `buf.len()` bytes at `addr`. One unreadable page anywhere in
+        /// the range fails the whole ReadProcessMemory call, and the
+        /// follower's reads deliberately overhang the region on both sides;
+        /// so on failure the range is read page by page, unreadable pages
+        /// zero-filled (a NUL run separator to the decoder), and the length
+        /// through the last readable page is returned.
         fn read(&self, addr: usize, buf: &mut [u8]) -> usize {
             let mut got = 0usize;
             let ok = unsafe {
                 ReadProcessMemory(self.0, addr, buf.as_mut_ptr(), buf.len(), &mut got)
             };
-            if ok != 0 { got } else { 0 }
+            if ok != 0 {
+                return got;
+            }
+            const PAGE: usize = 0x1000;
+            let mut last = 0usize;
+            let mut off = 0usize;
+            while off < buf.len() {
+                let n = (buf.len() - off).min(PAGE - ((addr + off) % PAGE));
+                let mut g = 0usize;
+                let ok = unsafe { ReadProcessMemory(self.0, addr + off, buf[off..].as_mut_ptr(), n, &mut g) };
+                if ok != 0 && g > 0 {
+                    last = off + g;
+                } else {
+                    buf[off..off + n].fill(0);
+                }
+                off += n;
+            }
+            last
         }
     }
 
@@ -802,20 +875,31 @@ pub mod memory {
         use std::collections::HashMap;
         let mut bins: HashMap<usize, (u32, String)> = HashMap::new();
         let mut buf = vec![0u8; 0x100000];
-        let mut addr = 0x10000usize;
         let mut bytes = 0usize;
-        while addr < 0x7FFF_0000 {
-            let got = p.read(addr, &mut buf);
-            if got > 0 {
+        // Only committed, readable regions, over the full 4 GB the
+        // large-address-aware client can use; a region is read in 1 MiB
+        // pieces with a 1 KiB overlap so a line straddling a piece boundary
+        // is still seen whole once.
+        const OVERLAP: usize = 0x400;
+        for (base, size) in p.regions() {
+            let mut addr = base;
+            let end = base + size;
+            while addr < end {
+                let len = (end - addr).min(buf.len());
+                let got = p.read(addr, &mut buf[..len]);
+                if got == 0 {
+                    break;
+                }
                 bytes += got;
                 for l in extract(&buf[..got], grammar_ok) {
                     let e = bins.entry((addr + l.off) >> 16).or_insert((0, String::new()));
                     e.0 += 1;
                     e.1 = l.text;
                 }
-                addr += got.max(1);
-            } else {
-                addr += 0x100000;
+                if addr + got >= end {
+                    break;
+                }
+                addr += got.saturating_sub(OVERLAP).max(1);
             }
         }
         (bins, bytes)
@@ -982,7 +1066,7 @@ pub mod memory {
 
             // (Re)scan the client for combat text: at start, whenever nothing
             // is being followed, every 10 s while the followed region has been
-            // quiet for 20 s (it may have been reallocated), else every 2 min.
+            // quiet for 20 s (it may have been reallocated), else every 10 min.
             // A freshly started client has no combat text at all until the
             // first fight; rescan every 5 s in that state.
             let idle = primary.map_or(true, |p| now - cands[p].last_change > 20.0);
@@ -994,7 +1078,10 @@ pub mod memory {
                 Some("no-primary")
             } else if idle && now - last_scan > 10.0 {
                 Some("idle")
-            } else if now - last_scan > 120.0 {
+            } else if now - last_scan > 600.0 {
+                // A moving region IS the live buffer; the idle rule above
+                // catches a reallocation. This is only a safety net, and a
+                // scan blocks the follower for many seconds, so it is rare.
                 Some("periodic")
             } else {
                 None
