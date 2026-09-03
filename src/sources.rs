@@ -1,9 +1,9 @@
 //! Event sources. All produce the same `Event`s into a `Sink`, so the meter and
 //! log don't care where combat came from:
-//!   * `chatlog_tail` — tails the player's own chatlog (works today).
-//!   * `ipc_ring`     — drains combat spam from a shared-memory ring fed by an
+//!   * `chatlog_tail` â€” tails the player's own chatlog (works today).
+//!   * `ipc_ring`     â€” drains combat spam from a shared-memory ring fed by an
 //!                      external producer (zero flush latency).
-//!   * `demo`         — synthetic combat, no game needed.
+//!   * `demo`         â€” synthetic combat, no game needed.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -15,12 +15,15 @@ use crate::event::{EntityKind, Event, Kind, Outcome};
 use crate::logwriter::LogWriter;
 use crate::meter::{now_secs, Meter};
 use crate::parse::{line_time_of_day, login_epoch, parse_line_colored, Parsed};
+use crate::trace::Tracer;
 
 /// Fan-out target: parse+meter+log. Cloneable handle over shared state.
 #[derive(Clone)]
 pub struct Sink {
     pub meter: Arc<Mutex<Meter>>,
     pub log: Option<Arc<Mutex<LogWriter>>>,
+    /// `--trace`: the memory source's diagnostic trace (None = off).
+    pub trace: Option<Arc<Tracer>>,
 }
 
 impl Sink {
@@ -293,7 +296,7 @@ pub fn demo(sink: Sink) {
             color: None,
         });
         // Occasionally go quiet longer than the encounter gap, so the "Now"
-        // encounter closes and rolls into "Last" — mimics a fight ending.
+        // encounter closes and rolls into "Last" â€” mimics a fight ending.
         if rng() % 100 < 8 {
             std::thread::sleep(Duration::from_millis(11_000));
         } else {
@@ -415,11 +418,11 @@ pub mod ipc {
 
     /// Poll the ring forever, reconnecting if the client or producer restarts.
     pub fn ipc_ring(sink: Sink) {
-        sink.set_log_label("(IPC ring — waiting for producer)");
+        sink.set_log_label("(IPC ring â€” waiting for producer)");
         loop {
             match open() {
                 Some(map) => {
-                    sink.set_log_label("(IPC ring — connected)");
+                    sink.set_log_label("(IPC ring â€” connected)");
                     loop {
                         {
                             let mut m = sink.meter.lock().unwrap();
@@ -429,7 +432,7 @@ pub mod ipc {
                         if fed > 0 {
                             sink.mark_fresh(now_secs());
                         }
-                        // If the producer went away, magic clears — bail to reconnect.
+                        // If the producer went away, magic clears â€” bail to reconnect.
                         let alive = unsafe {
                             at(map.base, OFF_MAGIC).load(Ordering::Acquire) == ABI_MAGIC
                         };
@@ -454,7 +457,7 @@ pub mod ipc {
 }
 
 // --------------------------------------------------------------------------
-// memory (external read-only reader — no injection)
+// memory (external read-only reader â€” no injection)
 // --------------------------------------------------------------------------
 //
 // Opens SwgClient_r.exe and reads its combat chat-scrollback directly via
@@ -464,7 +467,7 @@ pub mod ipc {
 // (name + hits/crits/glances/strikes/heals + "N pts"), which cleanly rejects
 // UI/table junk that merely contains " pts". We locate the buffer ONCE (a
 // one-time grammar scan), then each tick read only that region and emit new
-// lines — never a per-tick wide scan.
+// lines â€” never a per-tick wide scan.
 
 #[cfg(windows)]
 pub mod memory {
@@ -505,7 +508,7 @@ pub mod memory {
     }
 
     /// Full path of the running game client's executable, e.g.
-    /// `C:\SWG Legends\SwgClient_r.exe` — the one reliable way to find the
+    /// `C:\SWG Legends\SwgClient_r.exe` â€” the one reliable way to find the
     /// install. Needs only limited query rights, which Windows grants even
     /// across elevation levels.
     pub fn client_exe_path() -> Option<std::path::PathBuf> {
@@ -566,8 +569,8 @@ pub mod memory {
         }
     }
     impl Proc {
-        /// Still running? (A handle keeps working after the process exits —
-        /// every read just fails — so this is checked explicitly.)
+        /// Still running? (A handle keeps working after the process exits â€”
+        /// every read just fails â€” so this is checked explicitly.)
         fn alive(&self) -> bool {
             extern "system" {
                 fn GetExitCodeProcess(h: Handle, code: *mut u32) -> i32;
@@ -610,7 +613,7 @@ pub mod memory {
         has_verb && (ends || l.contains("points of") || l.contains(" points ("))
     }
 
-    /// Wide acceptor used while TAILING: everything `parse.rs` understands —
+    /// Wide acceptor used while TAILING: everything `parse.rs` understands â€”
     /// hits, DoTs, heals, misses/avoids, ability announcements, deaths. The
     /// strict grammar alone silently dropped every miss and every "performs"
     /// line, so this source never counted avoids or labeled abilities.
@@ -708,7 +711,7 @@ pub mod memory {
     /// `Line::color`); only accepted combat lines are kept. The live
     /// scrollback is one contiguous string: lines joined by `\n`, the newest
     /// line ending right at a NUL, and stale fragments of older (longer) text
-    /// beyond that NUL. A line cut off by the END of the window is discarded —
+    /// beyond that NUL. A line cut off by the END of the window is discarded â€”
     /// it is not a real line.
     fn extract_runs(win: &[u8], accept: fn(&str) -> bool) -> Vec<Vec<Line>> {
         let mut runs: Vec<Vec<Line>> = Vec::new();
@@ -776,7 +779,7 @@ pub mod memory {
     }
 
     /// The live scrollback in a window read at `base`: the run that covers the
-    /// candidate region `lo..hi` — a bigger, frozen copy elsewhere in the
+    /// candidate region `lo..hi` â€” a bigger, frozen copy elsewhere in the
     /// window must not win just by size. Among covering runs the largest; if
     /// none covers it, the largest overall. Stale fragments past the run's NUL
     /// and unrelated heap text are left out, so the run's last line really is
@@ -793,15 +796,18 @@ pub mod memory {
     }
 
     /// Full grammar-scan of the 32-bit space; per 64 KiB bin record the combat
-    /// line count and the most recent (last) line's text.
-    fn scan_bins(p: &Proc) -> std::collections::HashMap<usize, (u32, String)> {
+    /// line count and the most recent (last) line's text. Also returns the
+    /// number of bytes read.
+    fn scan_bins(p: &Proc) -> (std::collections::HashMap<usize, (u32, String)>, usize) {
         use std::collections::HashMap;
         let mut bins: HashMap<usize, (u32, String)> = HashMap::new();
         let mut buf = vec![0u8; 0x100000];
         let mut addr = 0x10000usize;
+        let mut bytes = 0usize;
         while addr < 0x7FFF_0000 {
             let got = p.read(addr, &mut buf);
             if got > 0 {
+                bytes += got;
                 for l in extract(&buf[..got], grammar_ok) {
                     let e = bins.entry((addr + l.off) >> 16).or_insert((0, String::new()));
                     e.0 += 1;
@@ -812,7 +818,7 @@ pub mod memory {
                 addr += 0x100000;
             }
         }
-        bins
+        (bins, bytes)
     }
 
     /// Candidate scrollback regions from a scan: maximal spans of consecutive
@@ -844,6 +850,10 @@ pub mod memory {
         empty_ticks: u32,
         nlines: usize,
         emitted_any: bool,
+        /// last window read of this region (`got` valid bytes)
+        buf: Vec<u8>,
+        got: usize,
+        warned_trunc: bool,
     }
 
     /// Where we are in the buffer: the last line we emitted, identified by the
@@ -904,7 +914,7 @@ pub mod memory {
                 Some(p) => p,
                 None => {
                     if !announced {
-                        sink.set_log_label("(memory: SwgClient_r.exe not running — waiting for the game to start)");
+                        sink.set_log_label("(memory: SwgClient_r.exe not running â€” waiting for the game to start)");
                         announced = true;
                     }
                     std::thread::sleep(Duration::from_secs(2));
@@ -914,42 +924,61 @@ pub mod memory {
             announced = false;
             let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
             if h.is_null() {
-                sink.set_log_label("(memory: OpenProcess failed — run swglogs as Administrator)");
+                sink.set_log_label("(memory: OpenProcess failed â€” run swglogs as Administrator)");
                 eprintln!("[swglogs] OpenProcess failed; run as Administrator");
                 return;
             }
             let proc = Proc(h);
-            sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} — scanning for combat text)", pid));
+            sink.set_log_label(&format!("(memory: SwgClient_r.exe pid {} â€” scanning for combat text)", pid));
             follow(&sink, &proc, pid);
-            sink.set_log_label(&format!("(memory: game client pid {} exited — waiting for it to start again)", pid));
+            sink.set_log_label(&format!("(memory: game client pid {} exited â€” waiting for it to start again)", pid));
             std::thread::sleep(Duration::from_secs(2));
         }
     }
 
     /// Track one client process's combat text until that process exits.
     fn follow(sink: &Sink, proc: &Proc, pid: u32) {
+        use crate::trace::{Rec, Tracer};
+        use std::time::Instant;
 
         const SLACK: usize = 0x8000; // read this much before/after a region
+        const WIN: usize = 0x80000; // up to 512 KiB per candidate read
+        let tr: Option<&Tracer> = sink.trace.as_deref();
+        let trace_suffix = tr.map(|t| format!(", trace → {}", t.dir.display())).unwrap_or_default();
         let mut cands: Vec<Cand> = Vec::new();
         let mut primary: Option<usize> = None;
         let mut last_scan = 0.0f64;
         let mut resyncs = 0u32;
         let mut last_label = String::new();
-        let mut dump_n = 0u32;
-        let mut win = vec![0u8; 0x80000]; // up to 512 KiB per candidate read
-        let mut win2 = vec![0u8; 0x80000]; // second read of the primary: torn-read check
+        let mut last_tick_rec = 0.0f64;
+        let mut last_hb_snap = 0.0f64;
+        let mut last_torn_snap = 0.0f64;
+        let mut win2 = vec![0u8; WIN]; // second read of the primary: torn-read check
         let pinned = std::env::var("SWGLOGS_MEMREGION").ok()
             .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+        let short = |s: &str| -> String { s.chars().take(96).collect() };
+        let snap_lines = |lines: &[Line]| -> Vec<(usize, String)> { lines.iter().map(|l| (l.off, l.text.clone())).collect() };
+
+        if let Some(t) = tr {
+            t.rec(Rec::new("start", now_secs()).u("pid", pid as usize).s("version", env!("CARGO_PKG_VERSION"))
+                .b("pinned", pinned.is_some()));
+        }
 
         loop {
+            let t0 = Instant::now();
             {
                 let mut m = sink.meter.lock().unwrap();
                 m.tick(now_secs());
             }
-            let now = now_secs();
+            let mut now = now_secs();
             if !proc.alive() {
+                if let Some(t) = tr {
+                    t.rec(Rec::new("exit", now).u("pid", pid as usize));
+                }
                 return;
             }
+            let mut scanned = false;
+            let mut snap_tags: Vec<&'static str> = Vec::new();
 
             // (Re)scan the client for combat text: at start, whenever nothing
             // is being followed, every 10 s while the followed region has been
@@ -957,29 +986,79 @@ pub mod memory {
             // A freshly started client has no combat text at all until the
             // first fight; rescan every 5 s in that state.
             let idle = primary.map_or(true, |p| now - cands[p].last_change > 20.0);
-            if (cands.is_empty() && now - last_scan > 5.0) || (idle && now - last_scan > 10.0) || now - last_scan > 120.0 {
+            let reason = if last_scan == 0.0 {
+                Some("initial")
+            } else if cands.is_empty() && now - last_scan > 5.0 {
+                Some("no-candidates")
+            } else if primary.is_none() && now - last_scan > 10.0 {
+                Some("no-primary")
+            } else if idle && now - last_scan > 10.0 {
+                Some("idle")
+            } else if now - last_scan > 120.0 {
+                Some("periodic")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                scanned = true;
                 last_scan = now;
+                let ts = Instant::now();
+                let (bins, bytes) = match pinned {
+                    Some(_) => (std::collections::HashMap::new(), 0usize),
+                    None => scan_bins(proc),
+                };
                 let regions = match pinned {
                     Some(r) => vec![(r, r + 0x10000)],
-                    None => candidates(&scan_bins(proc)),
+                    None => candidates(&bins),
                 };
+                let scan_ms = ts.elapsed().as_millis() as usize;
                 let prim_region = primary.map(|p| (cands[p].start, cands[p].end));
                 let mut next: Vec<Cand> = Vec::with_capacity(regions.len());
+                let mut desc: Vec<String> = Vec::new();
                 for (st, en) in regions {
+                    if tr.is_some() {
+                        let mut n = 0u32;
+                        let mut last = String::new();
+                        let mut b = st;
+                        while b < en {
+                            if let Some((c, l)) = bins.get(&(b >> 16)) {
+                                n += c;
+                                last = l.clone();
+                            }
+                            b += 0x10000;
+                        }
+                        desc.push(Tracer::obj(&[
+                            ("region", crate::event::json_str(&format!("0x{:08X}-0x{:08X}", st, en))),
+                            ("hits", n.to_string()),
+                            ("last", crate::event::json_str(&short(&last))),
+                            ("known", cands.iter().any(|c| c.start == st && c.end == en).to_string()),
+                        ]));
+                    }
                     match cands.iter().position(|c| c.start == st && c.end == en) {
                         Some(i) => next.push(cands.swap_remove(i)),
                         None => next.push(Cand {
                             start: st, end: en, anchor: None, prev_tail: None, last_change: 0.0,
                             changed_now: false, empty_ticks: 0, nlines: 0, emitted_any: false,
+                            buf: Vec::new(), got: 0, warned_trunc: false,
                         }),
                     }
                 }
+                let gone: Vec<String> = cands.iter().map(|c| format!("0x{:08X}-0x{:08X}", c.start, c.end)).collect();
                 cands = next;
                 primary = prim_region.and_then(|(st, en)| cands.iter().position(|c| c.start == st && c.end == en));
+                // The scan blocks for seconds: everything after it must use
+                // the current time, not the one from before the scan.
+                now = now_secs();
+                if let Some(t) = tr {
+                    t.rec(Rec::new("scan", now).s("reason", reason).u("ms", scan_ms).u("bytes", bytes)
+                        .raw_arr("candidates", &desc).strs("gone", &gone)
+                        .b("primary_kept", primary.is_some()));
+                }
+                snap_tags.push("scan");
                 if cands.is_empty() {
                     sink.set_log_label(&format!(
-                        "(memory: pid {} — the client has no combat text yet (fresh login / no fight since it started);                          hit something and it appears within a few seconds)",
-                        pid
+                        "(memory: pid {} — the client has no combat text yet (fresh login / no fight since it started);                          hit something and it appears within a few seconds){}",
+                        pid, trace_suffix
                     ));
                 }
             }
@@ -993,9 +1072,20 @@ pub mod memory {
             let mut lines_of: Vec<Vec<Line>> = Vec::with_capacity(cands.len());
             for c in cands.iter_mut() {
                 let base = c.start.saturating_sub(SLACK);
-                let len = (c.end + SLACK - base).min(win.len());
-                let got = proc.read(base, &mut win[..len]);
-                let lines = if got > 0 { live_run(&win[..got], base, c.start, c.end) } else { Vec::new() };
+                let want = c.end + SLACK - base;
+                let len = want.min(WIN);
+                if want > WIN && !c.warned_trunc {
+                    c.warned_trunc = true;
+                    if let Some(t) = tr {
+                        t.rec(Rec::new("truncated", now).region("region", c.start, c.end).u("want", want).u("read", len));
+                    }
+                }
+                if c.buf.len() < len {
+                    c.buf.resize(len, 0);
+                }
+                let got = proc.read(base, &mut c.buf[..len]);
+                c.got = got;
+                let lines = if got > 0 { live_run(&c.buf[..got], base, c.start, c.end) } else { Vec::new() };
                 c.nlines = lines.len();
                 let tail = lines.last().map(|l| l.text.clone());
                 c.changed_now = tail.is_some() && tail != c.prev_tail;
@@ -1008,6 +1098,16 @@ pub mod memory {
                 lines_of.push(lines);
             }
 
+            // Fresh scan with nothing followed yet: keep a copy of every
+            // candidate so the choice can be checked offline.
+            if scanned && primary.is_none() {
+                if let Some(t) = tr {
+                    for (c, ls) in cands.iter().zip(lines_of.iter()) {
+                        t.snapshot(now, "cand", c.start.saturating_sub(SLACK), c.start, c.end, &c.buf[..c.got], &snap_lines(ls));
+                    }
+                }
+            }
+
             // Follow the region that advanced most recently. Switch away from
             // the current one only once it has been quiet for 5 s while
             // another one moved (so two mirrors of the same text never
@@ -1017,23 +1117,39 @@ pub mod memory {
                 .max_by(|a, b| a.1.last_change.partial_cmp(&b.1.last_change).unwrap())
                 .map(|(i, _)| i);
             match (primary, best) {
-                (None, Some(b)) => primary = Some(b),
+                (None, Some(b)) => {
+                    primary = Some(b);
+                    if let Some(t) = tr {
+                        t.rec(Rec::new("primary", now).region("region", cands[b].start, cands[b].end).u("lines", cands[b].nlines));
+                    }
+                }
                 (Some(p), Some(b)) if b != p && now - cands[p].last_change > 5.0 && cands[b].last_change > cands[p].last_change => {
                     // Carry the position across: the mirrors hold the same
                     // text, so the old anchor (text + context) is found in
                     // the new region and nothing in between is lost. If it is
                     // not found there, the anchor logic below reseeds.
+                    let found = cands[p].anchor.as_ref().and_then(|a| a.find(&lines_of[b]));
+                    if let Some(t) = tr {
+                        t.rec(Rec::new("switch", now)
+                            .region("from", cands[p].start, cands[p].end).region("to", cands[b].start, cands[b].end)
+                            .f("from_quiet_s", now - cands[p].last_change).u("from_lines", cands[p].nlines).u("to_lines", cands[b].nlines)
+                            .b("anchor_found", found.is_some())
+                            .i("between", found.map_or(-1, |i| (lines_of[b].len() as i64 - 1) - i as i64)));
+                        let c = &cands[p];
+                        t.snapshot(now, "switch-old", c.start.saturating_sub(SLACK), c.start, c.end, &c.buf[..c.got], &snap_lines(&lines_of[p]));
+                    }
                     cands[b].anchor = cands[p].anchor.clone();
                     cands[b].emitted_any = cands[p].emitted_any;
                     primary = Some(b);
                     resyncs += 1;
+                    snap_tags.push("switch-new");
                 }
                 _ => {}
             }
             let p = match primary {
                 Some(p) => p,
                 None => {
-                    let mut lab = format!("(memory: pid {} — {} candidate region(s); waiting for combat to see which one is live)", pid, cands.len());
+                    let mut lab = format!("(memory: pid {} — {} candidate region(s); waiting for combat to see which one is live{})", pid, cands.len(), trace_suffix);
                     for c in &cands {
                         lab.push_str(&format!("
    0x{:08X}-0x{:08X} {:4} lines{}", c.start, c.end, c.nlines,
@@ -1042,6 +1158,10 @@ pub mod memory {
                     if lab != last_label {
                         sink.set_log_label(&lab);
                         last_label = lab;
+                        if let Some(t) = tr {
+                            let regs: Vec<String> = cands.iter().map(|c| format!("0x{:08X}-0x{:08X} {} lines", c.start, c.end, c.nlines)).collect();
+                            t.rec(Rec::new("waiting", now).strs("candidates", &regs));
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(250));
                     continue;
@@ -1053,6 +1173,11 @@ pub mod memory {
                 cands[p].empty_ticks += 1;
                 if cands[p].empty_ticks > 24 {
                     // gone (freed/reallocated): forget it and rescan
+                    if let Some(t) = tr {
+                        let c = &cands[p];
+                        t.rec(Rec::new("dropped", now).region("region", c.start, c.end).u("empty_ticks", c.empty_ticks as usize).u("got", c.got));
+                        t.snapshot(now, "dropped", c.start.saturating_sub(SLACK), c.start, c.end, &c.buf[..c.got], &[]);
+                    }
                     cands.remove(p);
                     primary = None;
                     last_scan = 0.0;
@@ -1070,23 +1195,12 @@ pub mod memory {
             let base = cands[p].start.saturating_sub(SLACK);
             let len = (cands[p].end + SLACK - base).min(win2.len());
             let got2 = proc.read(base, &mut win2[..len]);
-            // Diagnostic: SWGLOGS_MEMDUMP=<dir> writes the raw window for the
-            // first 12 ticks with a followed region, for offline analysis.
-            if let Ok(dir) = std::env::var("SWGLOGS_MEMDUMP") {
-                if dump_n < 12 {
-                    let _ = fs::write(format!("{}/win_{:02}_{:08X}_{}.bin", dir, dump_n, base, got2), &win2[..got2]);
-                    dump_n += 1;
-                    if dump_n == 12 {
-                        eprintln!("[swglogs] memdump complete");
-                        std::process::exit(0);
-                    }
-                }
-            }
-            let confirm: std::collections::HashSet<String> = if got2 > 0 {
-                live_run(&win2[..got2], base, cands[p].start, cands[p].end).into_iter().map(|l| l.text).collect()
+            let confirm_lines = if got2 > 0 {
+                live_run(&win2[..got2], base, cands[p].start, cands[p].end)
             } else {
-                std::collections::HashSet::new()
+                Vec::new()
             };
+            let confirm: std::collections::HashSet<&str> = confirm_lines.iter().map(|l| l.text.as_str()).collect();
 
             // Hold-back: the newest line is the one the game may still be
             // writing; it is consumed only once it reads the same on two
@@ -1094,9 +1208,14 @@ pub mod memory {
             let stable = !cands[p].changed_now;
 
             // Where do the new lines start?
+            let mut resynced = false;
             let from = match &cands[p].anchor {
                 None => {
                     // seed to the end without replaying the backlog
+                    if let Some(t) = tr {
+                        t.rec(Rec::new("seed", now).region("region", cands[p].start, cands[p].end).u("skipped", lines.len())
+                            .s("tail", &short(&lines[lines.len() - 1].text)));
+                    }
                     cands[p].anchor = Some(Anchor::seed(&lines, lines.len() - 1));
                     lines.len()
                 }
@@ -1108,21 +1227,47 @@ pub mod memory {
                         if cands[p].emitted_any {
                             resyncs += 1;
                         }
+                        resynced = true;
+                        if let Some(t) = tr {
+                            t.rec(Rec::new("resync", now).region("region", cands[p].start, cands[p].end)
+                                .u("unemitted", lines.len()).b("emitted_any", cands[p].emitted_any)
+                                .strs("anchor_ctx", &a.ctx).hex("anchor_off", a.off)
+                                .s("head", &short(&lines[0].text)).s("tail", &short(&lines[lines.len() - 1].text)));
+                        }
                         cands[p].anchor = Some(Anchor::seed(&lines, lines.len() - 1));
                         lines.len()
                     }
                 },
             };
+            if resynced {
+                snap_tags.push("resync");
+            }
             let mut to = if stable { lines.len() } else { lines.len() - 1 };
             // stop at the first line the second read does not confirm; it is
             // re-read next tick (nothing is skipped)
-            if let Some(i) = lines[from..to.max(from)].iter().position(|l| !confirm.contains(&l.text)) {
+            let mut torn_at: i64 = -1;
+            if let Some(i) = lines[from..to.max(from)].iter().position(|l| !confirm.contains(l.text.as_str())) {
                 to = from + i;
+                torn_at = to as i64;
+                if let Some(t) = tr {
+                    t.rec(Rec::new("torn", now).region("region", cands[p].start, cands[p].end).u("at", to)
+                        .s("line", &short(&lines[to].text)).u("lines", lines.len()).u("confirm_lines", confirm_lines.len()));
+                    if now - last_torn_snap > 2.0 {
+                        last_torn_snap = now;
+                        let c = &cands[p];
+                        t.snapshot(now, "torn-a", base, c.start, c.end, &c.buf[..c.got], &snap_lines(&lines));
+                        t.snapshot(now, "torn-b", base, c.start, c.end, &win2[..got2], &snap_lines(&confirm_lines));
+                    }
+                }
             }
 
+            let emitted = to.saturating_sub(from);
             if from < to {
                 let ts = now_secs();
                 for l in &lines[from..to] {
+                    if let Some(t) = tr {
+                        t.raw(ts, cands[p].start, base + l.off, l.color, &l.text);
+                    }
                     sink.line_colored(&l.text, l.color, ts);
                 }
                 cands[p].anchor = Some(Anchor::seed(&lines, to - 1));
@@ -1130,10 +1275,34 @@ pub mod memory {
                 cands[p].emitted_any = true;
             }
 
+            let tick_ms = t0.elapsed().as_millis() as usize;
+            if let Some(t) = tr {
+                let c = &cands[p];
+                if emitted > 0 || c.changed_now || resynced || scanned || now - last_tick_rec > 5.0 {
+                    last_tick_rec = now;
+                    t.rec(Rec::new("tick", now).region("region", c.start, c.end).u("lines", c.nlines)
+                        .s("tail", &short(&lines[lines.len() - 1].text)).b("moved", c.changed_now).b("stable", stable)
+                        .u("from", from).u("to", to).u("emitted", emitted).i("torn_at", torn_at)
+                        .f("quiet_s", if c.last_change > 0.0 { now - c.last_change } else { -1.0 })
+                        .u("candidates", cands.len()).u("ms", tick_ms));
+                }
+                if now - last_hb_snap > 30.0 {
+                    last_hb_snap = now;
+                    snap_tags.push("hb");
+                }
+                for tag in &snap_tags {
+                    t.snapshot(now, tag, base, c.start, c.end, &c.buf[..c.got], &snap_lines(&lines));
+                }
+                if tick_ms > 500 {
+                    t.rec(Rec::new("stall", now).u("ms", tick_ms).s("phase", if scanned { "scan" } else { "tick" }));
+                }
+            }
+
             let mut lab = format!(
-                "(memory: pid {} region 0x{:08X}-0x{:08X}, {} lines, {} candidate region(s){})",
+                "(memory: pid {} region 0x{:08X}-0x{:08X}, {} lines, {} candidate region(s){}{})",
                 pid, cands[p].start, cands[p].end, cands[p].nlines, cands.len(),
-                if resyncs == 0 { String::new() } else { format!(", {} switches", resyncs) }
+                if resyncs == 0 { String::new() } else { format!(", {} switches", resyncs) },
+                trace_suffix
             );
             for c in &cands {
                 lab.push_str(&format!("
@@ -1148,7 +1317,139 @@ pub mod memory {
         }
     }
 
-    /// Pure-function checks, run by `swglogs --selftest`.
+    /// Print a digest of `trace.jsonl`: records per kind, scan and stall
+    /// times, lines sitting in the buffer at each resync (v1.9 dropped them).
+    fn summarize_trace(path: &std::path::Path) {
+        let Ok(text) = fs::read_to_string(path) else { return };
+        let field = |line: &str, key: &str| -> Option<String> {
+            let k = format!("\"{}\":", key);
+            let i = line.find(&k)? + k.len();
+            let rest = &line[i..];
+            if let Some(r) = rest.strip_prefix('"') {
+                Some(r[..r.find('"')?].to_string())
+            } else {
+                Some(rest[..rest.find(|c: char| c == ',' || c == '}')?].to_string())
+            }
+        };
+        let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let (mut scans, mut scan_ms, mut scan_max) = (0usize, 0usize, 0usize);
+        let (mut stalls, mut stall_ms) = (0usize, 0usize);
+        let (mut resyncs, mut unemitted) = (0usize, 0usize);
+        let mut emitted = 0usize;
+        let (mut t0, mut t1) = (0.0f64, 0.0f64);
+        for line in text.lines() {
+            let Some(kind) = field(line, "kind") else { continue };
+            *kinds.entry(kind.clone()).or_insert(0) += 1;
+            if let Some(ts) = field(line, "ts").and_then(|v| v.parse::<f64>().ok()) {
+                if t0 == 0.0 { t0 = ts; }
+                t1 = ts;
+            }
+            let ms = field(line, "ms").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            match kind.as_str() {
+                "scan" => { scans += 1; scan_ms += ms; scan_max = scan_max.max(ms); }
+                "stall" => { stalls += 1; stall_ms += ms; }
+                "resync" => { resyncs += 1; unemitted += field(line, "unemitted").and_then(|v| v.parse().ok()).unwrap_or(0); }
+                "tick" => { emitted += field(line, "emitted").and_then(|v| v.parse().ok()).unwrap_or(0); }
+                _ => {}
+            }
+        }
+        println!("trace.jsonl: {:.0}s span, records: {}", t1 - t0,
+            kinds.iter().map(|(k, n)| format!("{} {}", k, n)).collect::<Vec<_>>().join(", "));
+        if scans > 0 {
+            println!("  scans: {} taking {:.1}s total (avg {:.1}s, max {:.1}s) -- the follower reads nothing while a scan runs",
+                scans, scan_ms as f64 / 1000.0, scan_ms as f64 / 1000.0 / scans as f64, scan_max as f64 / 1000.0);
+        }
+        if stalls > 0 {
+            println!("  stalls: {} ticks over 500 ms, {:.1}s total", stalls, stall_ms as f64 / 1000.0);
+        }
+        println!("  lines emitted: {}; resyncs: {} with {} lines in the buffer at the time (v1.9 drops those)", emitted, resyncs, unemitted);
+        println!();
+    }
+
+    /// `--trace-replay DIR`: feed the snapshots a traced run saved through
+    /// the real decoder and anchor logic, in order, and print what the
+    /// follower would have done with each. No game needed.
+    pub fn replay(dir: &std::path::Path) -> i32 {
+        let mut files: Vec<(String, std::path::PathBuf)> = match fs::read_dir(dir) {
+            Ok(rd) => rd.flatten().filter_map(|e| {
+                let p = e.path();
+                let name = p.file_name()?.to_str()?.to_string();
+                if name.starts_with("win_") && name.ends_with(".bin") { Some((name, p)) } else { None }
+            }).collect(),
+            Err(e) => {
+                eprintln!("[swglogs] cannot read {}: {}", dir.display(), e);
+                return 1;
+            }
+        };
+        files.sort();
+        summarize_trace(&dir.join("trace.jsonl"));
+        if files.is_empty() {
+            eprintln!("[swglogs] no win_*.bin snapshots in {}", dir.display());
+            return 1;
+        }
+        let mut anchor: Option<Anchor> = None;
+        let mut t_first = 0.0f64;
+        let mut total_emit = 0usize;
+        let mut total_lost = 0usize;
+        for (name, path) in &files {
+            let Some((ts, tag, base, lo, hi)) = crate::trace::parse_snapshot_name(name) else {
+                println!("?? {}: unparsable name", name);
+                continue;
+            };
+            if t_first == 0.0 {
+                t_first = ts;
+            }
+            let win = match fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("?? {}: {}", name, e);
+                    continue;
+                }
+            };
+            let runs = extract_runs(&win, combat_like);
+            let lines = live_run(&win, base, lo, hi);
+            print!(
+                "+{:8.3}s {:<10} region 0x{:08X}-0x{:08X} base 0x{:08X} {:7} bytes  runs {:?}  live {} lines",
+                ts - t_first, tag, lo, hi, base, win.len(),
+                runs.iter().map(|r| r.len()).collect::<Vec<_>>(), lines.len()
+            );
+            if lines.is_empty() {
+                println!("  -> EMPTY");
+                continue;
+            }
+            match &anchor {
+                None => {
+                    println!("  -> seed at end (skip {} lines): {}", lines.len(), lines[lines.len() - 1].text);
+                    anchor = Some(Anchor::seed(&lines, lines.len() - 1));
+                }
+                Some(a) => match a.find(&lines) {
+                    Some(i) => {
+                        let n = lines.len() - 1 - i;
+                        total_emit += n;
+                        println!("  -> anchor at {} ; {} new lines", i, n);
+                        for l in &lines[i + 1..(i + 1 + n.min(3))] {
+                            println!("       {}", l.text);
+                        }
+                        if n > 3 {
+                            println!("       ... {} more", n - 3);
+                        }
+                        anchor = Some(Anchor::seed(&lines, lines.len() - 1));
+                    }
+                    None => {
+                        total_lost += lines.len();
+                        println!("  -> ANCHOR NOT FOUND: {} lines in the buffer would be dropped by v1.9", lines.len());
+                        println!("       anchor was: {}", a.ctx.last().map(String::as_str).unwrap_or(""));
+                        println!("       buffer head: {}", lines[0].text);
+                        println!("       buffer tail: {}", lines[lines.len() - 1].text);
+                        anchor = Some(Anchor::seed(&lines, lines.len() - 1));
+                    }
+                },
+            }
+        }
+        println!("\n{} snapshots; {} lines followed, {} lines in buffers at resync points", files.len(), total_emit, total_lost);
+        0
+    }
+
     pub fn selfcheck(check: &mut dyn FnMut(bool, &str)) {
         check(trim_combat("Yourname hits a bolma female 181 ptsbse)2 pts50or#.rget") == "Yourname hits a bolma female 181 pts",
               "memory: stale tail trimmed at FIRST numeric ' pts'");
@@ -1189,6 +1490,26 @@ pub mod memory {
                 && ls[0].text == "Yourname hits a kwi 500 pts",
             "memory: line colors captured, text stripped",
         );
+        // trace snapshot names round-trip (used by --trace-replay)
+        let n = crate::trace::parse_snapshot_name("win_1756800000123_switch-new_0A0B0C00_0A0B4000_0A0C0000.bin");
+        check(
+            n == Some((1756800000.123, "switch-new".to_string(), 0x0A0B0C00, 0x0A0B4000, 0x0A0C0000)),
+            "trace: snapshot file name round-trips",
+        );
+        // a traced window replays through the real decoder to the same lines
+        let dir = std::env::temp_dir().join(format!("swglogs-selftest-{}", std::process::id()));
+        let ok = (|| -> Option<bool> {
+            let t = crate::trace::Tracer::open(&dir).ok()?;
+            let ls2: Vec<(usize, String)> = ls.iter().map(|l| (l.off, l.text.clone())).collect();
+            let name = t.snapshot(1.5, "hb", 0x1000, 0x1000, 0x2000, &win, &ls2);
+            let (_, tag, base, lo, hi) = crate::trace::parse_snapshot_name(&name)?;
+            let back = fs::read(dir.join(&name)).ok()?;
+            let again = live_run(&back, base, lo, hi);
+            let txt = fs::read_to_string(dir.join(name.replace(".bin", ".txt"))).ok()?;
+            Some(tag == "hb" && again == ls && txt.contains("0x00001000	Yourname hits a kwi 500 pts"))
+        })();
+        let _ = fs::remove_dir_all(&dir);
+        check(ok == Some(true), "trace: snapshot writes .bin/.txt and replays to the same lines");
     }
 }
 
@@ -1199,6 +1520,10 @@ pub mod memory {
         eprintln!("[swglogs] memory source is Windows-only");
     }
     pub fn selfcheck(_check: &mut dyn FnMut(bool, &str)) {}
+    pub fn replay(_dir: &std::path::Path) -> i32 {
+        eprintln!("[swglogs] --trace-replay is Windows-only");
+        1
+    }
     pub fn client_pid() -> Option<u32> {
         None
     }

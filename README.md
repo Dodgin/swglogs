@@ -49,7 +49,8 @@ DIR` · `--log FILE` (pin an exact chatlog) · `--replay` (parse the whole log
 first, then tail) · `--out FILE` (JSONL log, default `combat-log.jsonl`) ·
 `--no-log` · `--selftest` · `--game-dir DIR` (game install; by default the
 folder of the running `SwgClient_r.exe`, else the parent of `--profiles`) ·
-`--no-ui-patch`.
+`--no-ui-patch` · `--trace [DIR]` (memory-source diagnostics, see below) ·
+`--trace-replay DIR`.
 
 On startup swglogs patches the game's loose `ui\ui_pda.inc` (if present) so the
 `/browser` window carries `StickyVisible='true'` and stays open when you leave
@@ -116,6 +117,18 @@ away:
   buffer's own line text (the scrollback shifts on every append once it hits
   its line cap), and holds the newest line back one tick so a line caught
   mid-write is never consumed torn.
+
+  **Diagnostics:** `--trace [DIR]` (default `swglogs-trace`) records every
+  decision the follower makes in `DIR	race.jsonl` (scan, tick, switch,
+  resync, dropped, torn, stall, truncated; `ts` is the same clock as
+  `combat-log.jsonl`, so the two interleave), every raw line handed to the
+  parser in `raw.txt` (timestamp, region, address, color, text), and raw
+  snapshots of the followed window (`win_*.bin` + a decoded `.txt`) at every
+  scan, switch, resync, drop, torn read and a 30 s heartbeat, capped at a
+  rolling 100 MB. `--trace-replay DIR` prints a digest of the trace and feeds
+  the snapshots back through the real decoder and follower, no game needed.
+  Off by default; zero cost when off. If the meter is missing lines, run one
+  session with `--trace` and send the folder.
 
 **Verbose combat spam is required.** In the game's Options, under the combat
 spam settings: set **Combat Spam** to **Verbose** (not Brief), turn on **Show

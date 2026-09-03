@@ -20,4 +20,5 @@ pub mod meter;
 pub mod parse;
 pub mod server;
 pub mod sources;
+pub mod trace;
 pub mod uipatch;

@@ -26,6 +26,9 @@ fn main() {
     if cfg.selftest {
         std::process::exit(selftest::run());
     }
+    if let Some(dir) = &cfg.trace_replay {
+        std::process::exit(swglogs::sources::memory::replay(dir));
+    }
     if cfg.restore_ui {
         match app::restore_ui(&cfg) {
             Ok(msg) => {
