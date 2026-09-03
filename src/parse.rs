@@ -446,6 +446,9 @@ fn parse_verbose(body: &str, low: &str) -> Option<Verbose> {
         ("hits", Outcome::Normal),
         ("crits", Outcome::Critical),
         ("glances", Outcome::Glancing),
+        // NGE "Punishing Blow": a hit that lands through the defender's
+        // block, always with a "(N points blocked)" modifier.
+        ("punishing blows", Outcome::Blocked),
         ("misses", Outcome::Miss),
     ];
     let mut best: Option<(usize, &str, Outcome)> = None;

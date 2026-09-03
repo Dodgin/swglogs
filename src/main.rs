@@ -105,6 +105,7 @@ mod selftest {
         "[Combat]  A giant baz nitch attacks Yourname with Bite (4) and hits (400 points blocked) for 159 points (159 kinetic). Armor absorbed 959 points out of 1118.",
         "[Combat]  A giant baz nitch attacks Yourname and hits for 151 points (151 kinetic). Armor absorbed 259 points out of 410.",
         "[Combat]  Yourname attacks a giant baz nitch using [UA][Lvl90][Cold] T21 Rifle and misses (dodge).",
+        "[Combat]  10:04:31 Super Battle Droid attacks Yourname and punishing blows (584 points blocked) for 2765 points (2765 energy)",
         // a damage announcement followed by its verbose hit, then a heal: the heal must NOT take the grenade's name
         "[Combat]  Yourname performs Cryoban Grenade 2.",
         "[Combat]  Yourname attacks a giant baz nitch with Cryoban Grenade 2 and hits for 100 points (100 acid).",
@@ -146,8 +147,8 @@ mod selftest {
         check(field(&snap, "Yourname", "dmg") == 844 + 973 + 1302 + 581 + 337 + 500 + 250 + verbose_out + 1881,
               "Yourname damage incl. glance + DoT + post-perform hit");
         check(field(&snap, "Yourname", "crits") == 1, "Yourname crit counted");
-        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296 + 159 + 151 + 200,
-              "Yourname taken incl. strikes-through + poison tick + verbose hits");
+        check(field(&snap, "Yourname", "taken") == 174 + 181 + 396 + 296 + 159 + 151 + 200 + 2765,
+              "Yourname taken incl. strikes-through + poison tick + verbose hits + punishing blow");
         check(field(&snap, "Yourname", "avoids") == 2, "Yourname misses counted (terse + verbose)");
         check(field(&snap, "Giant baz nitch", "taken") == verbose_out && field(&snap, "Giant baz nitch", "dmg") == 159 + 151,
               "verbose: giant baz nitch taken/dealt");
